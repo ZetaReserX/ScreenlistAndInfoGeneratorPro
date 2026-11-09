@@ -61,8 +61,6 @@ cargo build --release
 cargo run --release
 ```
 
----
-
 After running cargo build --release, the required runtime files in target\release\ are:
 
     screenlist_pro.exe
@@ -72,8 +70,6 @@ After running cargo build --release, the required runtime files in target\releas
     swscale-9.dll
     swresample-6.dll
 
----
-
 ## Tech Stack
 - **GUI Framework:** eframe / egui
 - **Video Decoding & Probing:** Custom C11 bridge (libav_bridge.c) linked against libavformat, libavcodec, libswscale, and libavutil
@@ -81,4 +77,4 @@ After running cargo build --release, the required runtime files in target\releas
 - **Image Processing & Typography:** image, ab_glyph, zip
 
 ## License
-**his project is distributed under the MIT / GPLv3 License (depending on the linked FFmpeg build configuration).**
+**This project is distributed under the MIT / GPLv3 License (depending on the linked FFmpeg build configuration).**
