@@ -1,0 +1,27 @@
+[package]
+name = "screenlist_pro"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27.2"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+ab_glyph = "0.2.32"
+rayon = "1.12.0"
+rfd = "0.14.1"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+cc = "1.1"
+
+[profile.dev]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
