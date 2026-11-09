@@ -26,10 +26,15 @@ Every video added to the queue is automatically analyzed and displays two ready-
 
 ### Batch Workflow & Export
 - **Flexible Input:** Add individual videos, **recursively scan folders and subfolders**, or **Drag & Drop** files/folders into the application window.
+  - Automatic Duplicate Video Detection
 - **Multiple Export Options:**
   - Save the currently selected screenlist as **JPEG** or **PNG**.
   - Batch-export all generated screenlists into a target directory.
   - Export all screenlists into a single **`.zip` archive** using multi-threaded JPEG encoding.
+  - Export and ZIP Archive Progress Bar
+
+### English and Russian Localization
+- **Localization Switch:** Can be switched between English or Russian localization.
 
 ---
 
