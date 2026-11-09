@@ -77,4 +77,4 @@ After running cargo build --release, the required runtime files in target\releas
 - **Image Processing & Typography:** image, ab_glyph, zip
 
 ## License
-**This project is distributed under the MIT / GPLv3 License (depending on the linked FFmpeg build configuration).**
+**This project is distributed under GPLv3 License.**
