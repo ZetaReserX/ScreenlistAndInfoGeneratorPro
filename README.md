@@ -59,8 +59,7 @@ cargo build --release
 
 # Run the application
 cargo run --release
-
-Packaging for Distribution
+```
 
 After running cargo build --release, the required runtime files in target\release\ are:
 
@@ -70,19 +69,6 @@ After running cargo build --release, the required runtime files in target\releas
     avutil-60.dll
     swscale-9.dll
     swresample-6.dll
-
-You can collect them into a clean ./dist folder with PowerShell:
-
-PowerShell
-
-New-Item -ItemType Directory -Path ".\dist" -Force | Out-Null
-Copy-Item ".\target\release\screenlist_pro.exe", `
-          ".\target\release\avcodec-*.dll", `
-          ".\target\release\avformat-*.dll", `
-          ".\target\release\avutil-*.dll", `
-          ".\target\release\swscale-*.dll", `
-          ".\target\release\swresample-*.dll" `
-          -Destination ".\dist\" -Force
 
 🧱 Tech Stack
 
