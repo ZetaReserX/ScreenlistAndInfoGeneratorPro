@@ -52,6 +52,22 @@ fn setup_custom_style(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Ru,
+    En,
+}
+
+impl Language {
+    #[inline]
+    fn tr<'a>(self, ru: &'a str, en: &'a str) -> &'a str {
+        match self {
+            Self::Ru => ru,
+            Self::En => en,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct CapturedFrame {
     timestamp: f64,
@@ -81,6 +97,8 @@ struct VideoItem {
     height: u32,
     video_info_line: String,
     audio_info_line: String,
+    video_info_line_en: String,
+    audio_info_line_en: String,
     status: VideoStatus,
     frames: Vec<CapturedFrame>,
     screenshots: Vec<CapturedFrame>,
@@ -91,6 +109,22 @@ struct VideoItem {
     last_cols: usize,
     last_thumb_w: u32,
     last_thumb_h: u32,
+}
+
+impl VideoItem {
+    fn video_info(&self, lang: Language) -> &str {
+        match lang {
+            Language::Ru => &self.video_info_line,
+            Language::En => &self.video_info_line_en,
+        }
+    }
+
+    fn audio_info(&self, lang: Language) -> &str {
+        match lang {
+            Language::Ru => &self.audio_info_line,
+            Language::En => &self.audio_info_line_en,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,6 +147,7 @@ struct RenderParams {
     hwaccel: bool,
     move_video_to_folder: bool,
     jpeg_quality: u8,
+    lang: Language,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -334,27 +369,48 @@ impl CpuTopology {
         available
     }
 
-    fn description(&self) -> String {
+    fn description(&self, lang: Language) -> String {
         if !self.detected {
-            return format!(
-                "Топология P/E не определена; доступно логических потоков: {}",
-                self.logical_processors
-            );
+            return match lang {
+                Language::Ru => format!(
+                    "Топология P/E не определена; доступно логических потоков: {}",
+                    self.logical_processors
+                ),
+                Language::En => format!(
+                    "P/E topology not detected; available logical threads: {}",
+                    self.logical_processors
+                ),
+            };
         }
 
         if self.is_hybrid() {
-            format!(
-                "Обнаружено {} P + {} E ядер ({} логических потоков)",
-                self.p_core_masks.len(),
-                self.e_core_masks.len(),
-                self.logical_processors
-            )
+            match lang {
+                Language::Ru => format!(
+                    "Обнаружено {} P + {} E ядер ({} логических потоков)",
+                    self.p_core_masks.len(),
+                    self.e_core_masks.len(),
+                    self.logical_processors
+                ),
+                Language::En => format!(
+                    "Detected {} P + {} E cores ({} logical threads)",
+                    self.p_core_masks.len(),
+                    self.e_core_masks.len(),
+                    self.logical_processors
+                ),
+            }
         } else {
-            format!(
-                "Обнаружено {} физических ядер ({} логических потоков)",
-                self.physical_core_count(),
-                self.logical_processors
-            )
+            match lang {
+                Language::Ru => format!(
+                    "Обнаружено {} физических ядер ({} логических потоков)",
+                    self.physical_core_count(),
+                    self.logical_processors
+                ),
+                Language::En => format!(
+                    "Detected {} physical cores ({} logical threads)",
+                    self.physical_core_count(),
+                    self.logical_processors
+                ),
+            }
         }
     }
 }
@@ -614,6 +670,8 @@ mod libav {
         pub height: u32,
         pub video_info_line: String,
         pub audio_info_line: String,
+        pub video_info_line_en: String,
+        pub audio_info_line_en: String,
     }
 
     unsafe extern "C" {
@@ -657,7 +715,7 @@ mod libav {
     fn path_to_cstring(path: &Path) -> Result<CString, String> {
         let path_str = path.to_string_lossy();
         CString::new(path_str.as_bytes())
-            .map_err(|_| "Путь к файлу содержит недопустимый нулевой байт.".to_owned())
+            .map_err(|_| "File path contains an invalid null byte.".to_owned())
     }
 
     fn read_err_buf(buf: &[c_char]) -> String {
@@ -839,7 +897,12 @@ mod libav {
             v_codec_str, info.width, info.height, aspect_str, fps_str, v_bitrate_str
         );
 
-        let audio_info_line = if info.has_audio != 0 {
+        let video_info_line_en = format!(
+            "Video: Codec: {}, Resolution: {}×{} ({}), Frame rate: {}, Bitrate: {}",
+            v_codec_str, info.width, info.height, aspect_str, fps_str, v_bitrate_str
+        );
+
+        let (audio_info_line, audio_info_line_en) = if info.has_audio != 0 {
             let a_codec_raw = read_c_char_buf(&info.audio_codec);
             let a_codec_str = format_audio_codec(&a_codec_raw);
             let sample_rate_str = if info.audio_sample_rate > 0 {
@@ -854,12 +917,17 @@ mod libav {
                 "N/A".to_owned()
             };
 
-            format!(
+            let ru = format!(
                 "Аудио: Кодек: {}, Частота: {}, Каналы: {}, Битрейт: {}",
                 a_codec_str, sample_rate_str, channels_str, a_bitrate_str
-            )
+            );
+            let en = format!(
+                "Audio: Codec: {}, Sample rate: {}, Channels: {}, Bitrate: {}",
+                a_codec_str, sample_rate_str, channels_str, a_bitrate_str
+            );
+            (ru, en)
         } else {
-            "Аудио: Отсутствует".to_owned()
+            ("Аудио: Отсутствует".to_owned(), "Audio: None".to_owned())
         };
 
         Ok(ProbedMedia {
@@ -868,6 +936,8 @@ mod libav {
             height: info.height,
             video_info_line,
             audio_info_line,
+            video_info_line_en,
+            audio_info_line_en,
         })
     }
 
@@ -907,7 +977,7 @@ mod libav {
             let frame_bytes = (target_w as usize)
                 .checked_mul(target_h as usize)
                 .and_then(|px| px.checked_mul(3))
-                .ok_or_else(|| "Переполнение буфера кадра.".to_owned())?;
+                .ok_or_else(|| "Frame buffer overflow.".to_owned())?;
 
             let mut rgb_buf = vec![0u8; frame_bytes + 64];
             let mut err_buf = [0 as c_char; 512];
@@ -931,7 +1001,7 @@ mod libav {
 
             rgb_buf.truncate(frame_bytes);
             RgbImage::from_raw(target_w, target_h, rgb_buf)
-                .ok_or_else(|| "Не удалось создать RgbImage.".to_owned())
+                .ok_or_else(|| "Failed to create RgbImage.".to_owned())
         }
     }
 
@@ -1034,6 +1104,7 @@ impl ScreenlistApp {
                 hwaccel: false,
                 move_video_to_folder: false,
                 jpeg_quality: 85,
+                lang: Language::Ru,
             },
             topology,
             is_processing: false,
@@ -1055,7 +1126,18 @@ impl ScreenlistApp {
         }
     }
 
+    #[inline]
+    fn lang(&self) -> Language {
+        self.params.lang
+    }
+
+    #[inline]
+    fn tr<'a>(&self, ru: &'a str, en: &'a str) -> &'a str {
+        self.params.lang.tr(ru, en)
+    }
+
     fn add_video_paths(&mut self, input_paths: Vec<PathBuf>) {
+        let lang = self.lang();
         let mut discovered_files = Vec::new();
         let mut had_directory = false;
 
@@ -1070,8 +1152,12 @@ impl ScreenlistApp {
 
         if discovered_files.is_empty() {
             if had_directory {
-                self.status_line =
-                    "В выбранной папке (и её подпапках) видеофайлы не найдены.".to_owned();
+                self.status_line = lang
+                    .tr(
+                        "В выбранной папке (и её подпапках) видеофайлы не найдены.",
+                        "No video files found in the selected folder (or its subfolders).",
+                    )
+                    .to_owned();
             }
             return;
         }
@@ -1102,6 +1188,8 @@ impl ScreenlistApp {
                         height: probed.height,
                         video_info_line: probed.video_info_line,
                         audio_info_line: probed.audio_info_line,
+                        video_info_line_en: probed.video_info_line_en,
+                        audio_info_line_en: probed.audio_info_line_en,
                         status: VideoStatus::Ready,
                         frames: Vec::new(),
                         screenshots: Vec::new(),
@@ -1120,17 +1208,27 @@ impl ScreenlistApp {
                     added_count += 1;
                 }
                 Err(error) => {
-                    last_error = Some(format!("Ошибка чтения {}: {}", file_name, error));
+                    last_error = Some(match lang {
+                        Language::Ru => format!("Ошибка чтения {}: {}", file_name, error),
+                        Language::En => format!("Error reading {}: {}", file_name, error),
+                    });
                 }
             }
         }
 
         if added_count > 0 {
-            self.status_line = format!(
-                "Добавлено видео: {} шт. (всего в очереди: {})",
-                added_count,
-                self.videos.len()
-            );
+            self.status_line = match lang {
+                Language::Ru => format!(
+                    "Добавлено видео: {} шт. (всего в очереди: {})",
+                    added_count,
+                    self.videos.len()
+                ),
+                Language::En => format!(
+                    "Added videos: {} (total in queue: {})",
+                    added_count,
+                    self.videos.len()
+                ),
+            };
         } else if let Some(error) = last_error {
             self.status_line = error;
         }
@@ -1141,6 +1239,7 @@ impl ScreenlistApp {
             return;
         }
 
+        let lang = self.lang();
         let mut unique_indices = indices;
         unique_indices.sort_unstable();
         unique_indices.dedup();
@@ -1165,7 +1264,9 @@ impl ScreenlistApp {
             .collect();
 
         if tasks.is_empty() {
-            self.status_line = "Нет видео для обработки.".to_owned();
+            self.status_line = lang
+                .tr("Нет видео для обработки.", "No videos to process.")
+                .to_owned();
             return;
         }
 
@@ -1198,7 +1299,12 @@ impl ScreenlistApp {
                     for task in &tasks {
                         let _ = tx.send(WorkerMsg::VideoError {
                             video_idx: task.0,
-                            error: format!("Не удалось создать пул потоков: {error}"),
+                            error: match params.lang {
+                                Language::Ru => {
+                                    format!("Не удалось создать пул потоков: {error}")
+                                }
+                                Language::En => format!("Failed to create thread pool: {error}"),
+                            },
                         });
                     }
 
@@ -1319,11 +1425,18 @@ impl ScreenlistApp {
                 if indexed_frames.len() != total_frames {
                     let _ = tx.send(WorkerMsg::VideoError {
                         video_idx,
-                        error: format!(
-                            "Получено {} кадров вместо {}.",
-                            indexed_frames.len(),
-                            total_frames
-                        ),
+                        error: match params.lang {
+                            Language::Ru => format!(
+                                "Получено {} кадров вместо {}.",
+                                indexed_frames.len(),
+                                total_frames
+                            ),
+                            Language::En => format!(
+                                "Decoded {} frames instead of {}.",
+                                indexed_frames.len(),
+                                total_frames
+                            ),
+                        },
                     });
                     continue;
                 }
@@ -1489,11 +1602,18 @@ impl ScreenlistApp {
         if count > 0 {
             let elapsed = started.elapsed();
             self.last_elapsed = Some(elapsed);
-            self.status_line = format!(
-                "Сетка перестроена из RAM-кэша ({} видео) за {:.1} мс",
-                count,
-                elapsed.as_secs_f64() * 1000.0
-            );
+            self.status_line = match self.lang() {
+                Language::Ru => format!(
+                    "Сетка перестроена из RAM-кэша ({} видео) за {:.1} мс",
+                    count,
+                    elapsed.as_secs_f64() * 1000.0
+                ),
+                Language::En => format!(
+                    "Grid rebuilt from RAM cache ({} videos) in {:.1} ms",
+                    count,
+                    elapsed.as_secs_f64() * 1000.0
+                ),
+            };
         }
     }
 
@@ -1618,6 +1738,8 @@ impl ScreenlistApp {
     }
 
     fn poll_worker_messages(&mut self, ctx: &egui::Context) {
+        let lang = self.lang();
+
         while let Ok(message) = self.rx.try_recv() {
             match message {
                 WorkerMsg::VideoStarted { video_idx } => {
@@ -1629,8 +1751,14 @@ impl ScreenlistApp {
 
                     if let Some(video) = self.videos.get_mut(video_idx) {
                         video.status = VideoStatus::Processing;
-                        self.status_line =
-                            format!("Декодирование (C libav): {} ...", video.file_name);
+                        self.status_line = match lang {
+                            Language::Ru => {
+                                format!("Декодирование (C libav): {} ...", video.file_name)
+                            }
+                            Language::En => {
+                                format!("Decoding (C libav): {} ...", video.file_name)
+                            }
+                        };
                     }
                 }
                 WorkerMsg::FrameProgress {
@@ -1643,10 +1771,16 @@ impl ScreenlistApp {
                     self.current_total_frames = total_frames;
 
                     if let Some(video) = self.videos.get(video_idx) {
-                        self.status_line = format!(
-                            "Декодирование (C libav): {} ({}/{})",
-                            video.file_name, self.current_done_frames, total_frames
-                        );
+                        self.status_line = match lang {
+                            Language::Ru => format!(
+                                "Декодирование (C libav): {} ({}/{})",
+                                video.file_name, self.current_done_frames, total_frames
+                            ),
+                            Language::En => format!(
+                                "Decoding (C libav): {} ({}/{})",
+                                video.file_name, self.current_done_frames, total_frames
+                            ),
+                        };
                     }
                 }
                 WorkerMsg::VideoFinished {
@@ -1707,11 +1841,18 @@ impl ScreenlistApp {
                         video.last_thumb_w = thumb_w;
                         video.last_thumb_h = thumb_h;
 
-                        self.status_line = format!(
-                            "Кадр #{} сдвинут (+1.0с) за {:.0} мс",
-                            frame_idx + 1,
-                            elapsed.as_secs_f64() * 1000.0
-                        );
+                        self.status_line = match lang {
+                            Language::Ru => format!(
+                                "Кадр #{} сдвинут (+1.0с) за {:.0} мс",
+                                frame_idx + 1,
+                                elapsed.as_secs_f64() * 1000.0
+                            ),
+                            Language::En => format!(
+                                "Frame #{} shifted (+1.0s) in {:.0} ms",
+                                frame_idx + 1,
+                                elapsed.as_secs_f64() * 1000.0
+                            ),
+                        };
                     }
                 }
                 WorkerMsg::VideoError { video_idx, error } => {
@@ -1723,7 +1864,10 @@ impl ScreenlistApp {
                         video.status = VideoStatus::Error(error.clone());
                     }
 
-                    self.status_line = format!("Ошибка: {error}");
+                    self.status_line = match lang {
+                        Language::Ru => format!("Ошибка: {error}"),
+                        Language::En => format!("Error: {error}"),
+                    };
                 }
                 WorkerMsg::BatchComplete {
                     total_elapsed,
@@ -1734,29 +1878,51 @@ impl ScreenlistApp {
                     self.last_elapsed = Some(total_elapsed);
                     self.batch_start_instant = None;
 
-                    let mut summary = format!(
-                        "Готово за {:.3} сек ({:.0} мс)",
-                        total_elapsed.as_secs_f64(),
-                        total_elapsed.as_secs_f64() * 1000.0
-                    );
+                    let mut summary = match lang {
+                        Language::Ru => format!(
+                            "Готово за {:.3} сек ({:.0} мс)",
+                            total_elapsed.as_secs_f64(),
+                            total_elapsed.as_secs_f64() * 1000.0
+                        ),
+                        Language::En => format!(
+                            "Done in {:.3} sec ({:.0} ms)",
+                            total_elapsed.as_secs_f64(),
+                            total_elapsed.as_secs_f64() * 1000.0
+                        ),
+                    };
 
                     if self.topology.is_hybrid() {
-                        summary.push_str(&format!(
-                            " | P-ядра: {} кадров | E-ядра: {} кадров",
-                            total_p_frames, total_e_frames
-                        ));
+                        match lang {
+                            Language::Ru => summary.push_str(&format!(
+                                " | P-ядра: {} кадров | E-ядра: {} кадров",
+                                total_p_frames, total_e_frames
+                            )),
+                            Language::En => summary.push_str(&format!(
+                                " | P-cores: {} frames | E-cores: {} frames",
+                                total_p_frames, total_e_frames
+                            )),
+                        }
                     }
 
                     self.status_line = if self.batch_error_count == 0 {
                         format!("✅ {summary}")
                     } else {
-                        format!(
-                            "⚠️ {summary} | Ошибок: {} | Последняя: {}",
-                            self.batch_error_count,
-                            self.last_batch_error
-                                .as_deref()
-                                .unwrap_or("неизвестная ошибка")
-                        )
+                        match lang {
+                            Language::Ru => format!(
+                                "⚠️ {summary} | Ошибок: {} | Последняя: {}",
+                                self.batch_error_count,
+                                self.last_batch_error
+                                    .as_deref()
+                                    .unwrap_or("неизвестная ошибка")
+                            ),
+                            Language::En => format!(
+                                "⚠️ {summary} | Errors: {} | Last: {}",
+                                self.batch_error_count,
+                                self.last_batch_error
+                                    .as_deref()
+                                    .unwrap_or("unknown error")
+                            ),
+                        }
                     };
                 }
             }
@@ -1764,7 +1930,11 @@ impl ScreenlistApp {
     }
 
     fn show_video_queue(&mut self, ui: &mut egui::Ui) {
-        ui.heading(format!("Очередь видео ({})", self.videos.len()));
+        let lang = self.lang();
+        ui.heading(match lang {
+            Language::Ru => format!("Очередь видео ({})", self.videos.len()),
+            Language::En => format!("Video Queue ({})", self.videos.len()),
+        });
         ui.separator();
 
         let processing = self.is_processing;
@@ -1810,7 +1980,9 @@ impl ScreenlistApp {
                             if !processing
                                 && ui
                                 .small_button("✖")
-                                .on_hover_text("Удалить из очереди")
+                                .on_hover_text(
+                                    lang.tr("Удалить из очереди", "Remove from queue"),
+                                )
                                 .clicked()
                             {
                                 remove_idx = Some(index);
@@ -1823,16 +1995,17 @@ impl ScreenlistApp {
                                 format_duration(video.duration),
                                 video.width,
                                 video.height,
-                                format_file_size(video.file_size)
+                                format_file_size_lang(video.file_size, lang)
                             ))
                                 .size(11.5)
                                 .color(egui::Color32::GRAY),
                         );
 
                         // Сначала строка с информацией о видео (копируется при клике)
+                        let v_line = video.video_info(lang);
                         let video_resp = ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&video.video_info_line)
+                                egui::RichText::new(v_line)
                                     .size(11.0)
                                     .color(egui::Color32::from_rgb(175, 195, 220)),
                             )
@@ -1843,14 +2016,18 @@ impl ScreenlistApp {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         if video_resp.clicked() {
-                            copied_line = Some(video.video_info_line.clone());
+                            copied_line = Some(v_line.to_owned());
                         }
-                        video_resp.on_hover_text("Нажмите, чтобы скопировать в буфер обмена");
+                        video_resp.on_hover_text(lang.tr(
+                            "Нажмите, чтобы скопировать в буфер обмена",
+                            "Click to copy to clipboard",
+                        ));
 
                         // Затем строка с информацией об аудио (копируется при клике)
+                        let a_line = video.audio_info(lang);
                         let audio_resp = ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&video.audio_info_line)
+                                egui::RichText::new(a_line)
                                     .size(11.0)
                                     .color(egui::Color32::from_rgb(165, 185, 210)),
                             )
@@ -1861,32 +2038,50 @@ impl ScreenlistApp {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         if audio_resp.clicked() {
-                            copied_line = Some(video.audio_info_line.clone());
+                            copied_line = Some(a_line.to_owned());
                         }
-                        audio_resp.on_hover_text("Нажмите, чтобы скопировать в буфер обмена");
+                        audio_resp.on_hover_text(lang.tr(
+                            "Нажмите, чтобы скопировать в буфер обмена",
+                            "Click to copy to clipboard",
+                        ));
 
                         match &video.status {
                             VideoStatus::Ready => {
-                                ui.label("⏳ Ожидает");
+                                ui.label(lang.tr("⏳ Ожидает", "⏳ Queued"));
                             }
                             VideoStatus::Processing => {
                                 ui.label(
-                                    egui::RichText::new("⚙ Обработка...")
+                                    egui::RichText::new(lang.tr("⚙ Обработка...", "⚙ Processing..."))
                                         .color(egui::Color32::from_rgb(255, 200, 80)),
                                 );
                             }
                             VideoStatus::Done(elapsed) => {
                                 let ss_info = if !video.screenshots.is_empty() {
-                                    format!(" (+{} скринш.)", video.screenshots.len())
+                                    match lang {
+                                        Language::Ru => {
+                                            format!(" (+{} скринш.)", video.screenshots.len())
+                                        }
+                                        Language::En => {
+                                            format!(" (+{} shots)", video.screenshots.len())
+                                        }
+                                    }
                                 } else {
                                     String::new()
                                 };
-                                ui.label(
-                                    egui::RichText::new(format!(
+                                let done_text = match lang {
+                                    Language::Ru => format!(
                                         "✅ Готово за {:.3} сек{}",
                                         elapsed.as_secs_f64(),
                                         ss_info
-                                    ))
+                                    ),
+                                    Language::En => format!(
+                                        "✅ Done in {:.3} sec{}",
+                                        elapsed.as_secs_f64(),
+                                        ss_info
+                                    ),
+                                };
+                                ui.label(
+                                    egui::RichText::new(done_text)
                                         .color(egui::Color32::from_rgb(80, 230, 145)),
                                 );
                             }
@@ -1905,7 +2100,10 @@ impl ScreenlistApp {
 
         if let Some(text) = copied_line {
             copy_text_to_clipboard(ui.ctx(), &text);
-            self.status_line = format!("📋 Скопировано в буфер обмена: {}", text);
+            self.status_line = match lang {
+                Language::Ru => format!("📋 Скопировано в буфер обмена: {}", text),
+                Language::En => format!("📋 Copied to clipboard: {}", text),
+            };
         }
 
         if let Some(index) = selected_idx {
@@ -1932,6 +2130,7 @@ impl ScreenlistApp {
     }
 
     fn show_preview_panel(&mut self, ui: &mut egui::Ui) -> Option<(usize, usize)> {
+        let lang = self.lang();
         let ss_count = self
             .active_idx
             .and_then(|idx| self.videos.get(idx))
@@ -1943,15 +2142,20 @@ impl ScreenlistApp {
             ui.selectable_value(
                 &mut self.active_tab,
                 PreviewTab::Screenlist,
-                egui::RichText::new("📋 Скринлист").size(14.5).strong(),
+                egui::RichText::new(lang.tr("📋 Скринлист", "📋 Screenlist"))
+                    .size(14.5)
+                    .strong(),
             );
 
             ui.add_space(6.0);
 
             let ss_tab_title = if ss_count > 0 {
-                format!("🖼 Скриншоты ({})", ss_count)
+                match lang {
+                    Language::Ru => format!("🖼 Скриншоты ({})", ss_count),
+                    Language::En => format!("🖼 Screenshots ({})", ss_count),
+                }
             } else {
-                "🖼 Скриншоты".to_owned()
+                lang.tr("🖼 Скриншоты", "🖼 Screenshots").to_owned()
             };
 
             ui.selectable_value(
@@ -1972,9 +2176,13 @@ impl ScreenlistApp {
     }
 
     fn show_active_sheet(&mut self, ui: &mut egui::Ui) -> Option<(usize, usize)> {
+        let lang = self.lang();
         let Some(active_idx) = self.active_idx else {
             ui.centered_and_justified(|ui| {
-                ui.label("Добавьте видео или папку, чтобы создать скринлист.");
+                ui.label(lang.tr(
+                    "Добавьте видео или папку, чтобы создать скринлист.",
+                    "Add videos or a folder to generate a screenlist.",
+                ));
             });
             return None;
         };
@@ -1994,22 +2202,26 @@ impl ScreenlistApp {
 
         let Some(video) = self.videos.get(active_idx) else {
             ui.centered_and_justified(|ui| {
-                ui.label("Видео не выбрано.");
+                ui.label(lang.tr("Видео не выбрано.", "No video selected."));
             });
             return None;
         };
 
         let Some(texture) = &video.sheet_texture else {
             ui.centered_and_justified(|ui| {
-                ui.label("Нажмите «Создать скринлист», чтобы начать обработку.");
+                ui.label(lang.tr(
+                    "Нажмите «Создать скринлист», чтобы начать обработку.",
+                    "Click \"Generate All\" or \"Generate Selected\" to start processing.",
+                ));
             });
             return None;
         };
 
         ui.label(
-            egui::RichText::new(
+            egui::RichText::new(lang.tr(
                 "Подсказка: кликните по кадру на листе, чтобы сдвинуть его на +1 секунду.",
-            )
+                "Tip: click any frame on the sheet to shift it by +1 second.",
+            ))
                 .size(12.5)
                 .color(egui::Color32::from_rgb(160, 180, 230)),
         );
@@ -2064,28 +2276,38 @@ impl ScreenlistApp {
     }
 
     fn show_active_screenshots(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang();
         let Some(active_idx) = self.active_idx else {
             ui.centered_and_justified(|ui| {
-                ui.label("Добавьте видео или папку, чтобы создать скриншоты.");
+                ui.label(lang.tr(
+                    "Добавьте видео или папку, чтобы создать скриншоты.",
+                    "Add videos or a folder to generate screenshots.",
+                ));
             });
             return;
         };
 
+        let screenshot_count_param = self.params.screenshot_count;
+
         let Some(video) = self.videos.get_mut(active_idx) else {
             ui.centered_and_justified(|ui| {
-                ui.label("Видео не выбрано.");
+                ui.label(lang.tr("Видео не выбрано.", "No video selected."));
             });
             return;
         };
 
         if video.screenshots.is_empty() {
             ui.centered_and_justified(|ui| {
-                if self.params.screenshot_count == 0 {
-                    ui.label(
+                if screenshot_count_param == 0 {
+                    ui.label(lang.tr(
                         "Количество полноразмерных скриншотов установлено в 0. Укажите от 1 до 10 сверху и запустите генерацию.",
-                    );
+                        "Full-resolution screenshot count is set to 0. Set it to 1–10 in the top bar and run generation.",
+                    ));
                 } else {
-                    ui.label("Нажмите «Создать скринлист», чтобы сгенерировать полноразмерные скриншоты.");
+                    ui.label(lang.tr(
+                        "Нажмите «Создать скринлист», чтобы сгенерировать полноразмерные скриншоты.",
+                        "Click \"Generate All\" or \"Generate Selected\" to generate full-resolution screenshots.",
+                    ));
                 }
             });
             return;
@@ -2167,7 +2389,11 @@ impl ScreenlistApp {
             let prev_clicked = ui
                 .add_enabled(
                     total > 1,
-                    egui::Button::new(egui::RichText::new("⬅ Предыдущий").size(14.0).strong())
+                    egui::Button::new(
+                        egui::RichText::new(lang.tr("⬅ Предыдущий", "⬅ Previous"))
+                            .size(14.0)
+                            .strong(),
+                    )
                         .min_size(egui::vec2(130.0, 30.0)),
                 )
                 .clicked();
@@ -2205,7 +2431,11 @@ impl ScreenlistApp {
             let next_clicked = ui
                 .add_enabled(
                     total > 1,
-                    egui::Button::new(egui::RichText::new("Следующий ➡").size(14.0).strong())
+                    egui::Button::new(
+                        egui::RichText::new(lang.tr("Следующий ➡", "Next ➡"))
+                            .size(14.0)
+                            .strong(),
+                    )
                         .min_size(egui::vec2(130.0, 30.0)),
                 )
                 .clicked();
@@ -2217,6 +2447,7 @@ impl ScreenlistApp {
     }
 
     fn save_current_sheet(&mut self) {
+        let lang = self.lang();
         let Some(active_idx) = self.active_idx else {
             return;
         };
@@ -2240,11 +2471,21 @@ impl ScreenlistApp {
             .save_file()
         {
             let Some(video) = self.videos.get_mut(active_idx) else {
-                self.status_line = "Скринлист больше недоступен.".to_owned();
+                self.status_line = lang
+                    .tr(
+                        "Скринлист больше недоступен.",
+                        "Screenlist is no longer available.",
+                    )
+                    .to_owned();
                 return;
             };
             let Some(sheet_image) = video.sheet_image.as_ref() else {
-                self.status_line = "Скринлист больше недоступен.".to_owned();
+                self.status_line = lang
+                    .tr(
+                        "Скринлист больше недоступен.",
+                        "Screenlist is no longer available.",
+                    )
+                    .to_owned();
                 return;
             };
 
@@ -2270,7 +2511,14 @@ impl ScreenlistApp {
             };
 
             if let Err(error) = fs::create_dir_all(&video_dir) {
-                self.status_line = format!("Ошибка создания папки {}: {error}", video_dir.display());
+                self.status_line = match lang {
+                    Language::Ru => {
+                        format!("Ошибка создания папки {}: {error}", video_dir.display())
+                    }
+                    Language::En => {
+                        format!("Error creating folder {}: {error}", video_dir.display())
+                    }
+                };
                 return;
             }
 
@@ -2282,7 +2530,10 @@ impl ScreenlistApp {
             let sheet_path = video_dir.join(sheet_file_name);
 
             if let Err(error) = save_rgb_image(sheet_image, &sheet_path, jpeg_quality) {
-                self.status_line = format!("Ошибка сохранения: {error}");
+                self.status_line = match lang {
+                    Language::Ru => format!("Ошибка сохранения: {error}"),
+                    Language::En => format!("Save error: {error}"),
+                };
                 return;
             }
 
@@ -2302,35 +2553,48 @@ impl ScreenlistApp {
             let mut move_note = String::new();
             if move_video {
                 let dst_video_path = video_dir.join(&video.file_name);
-                match move_video_file(&video.path, &dst_video_path) {
+                match move_video_file(&video.path, &dst_video_path, lang) {
                     Ok(()) => {
                         video.path = dst_video_path;
-                        move_note = " + видео перенесено".to_owned();
+                        move_note = lang
+                            .tr(" + видео перенесено", " + video moved")
+                            .to_owned();
                     }
                     Err(err) => {
-                        move_note = format!(" (ошибка переноса видео: {err})");
+                        move_note = match lang {
+                            Language::Ru => format!(" (ошибка переноса видео: {err})"),
+                            Language::En => format!(" (video move error: {err})"),
+                        };
                     }
                 }
             }
 
             if saved_shots > 0 {
-                self.status_line = format!(
-                    "Сохранено в папку {}: скринлист + {} скриншотов{}",
-                    video_dir.display(),
-                    saved_shots,
-                    move_note
-                );
+                self.status_line = match lang {
+                    Language::Ru => format!(
+                        "Сохранено в папку {}: скринлист + {} скриншотов{}",
+                        video_dir.display(),
+                        saved_shots,
+                        move_note
+                    ),
+                    Language::En => format!(
+                        "Saved to folder {}: screenlist + {} screenshots{}",
+                        video_dir.display(),
+                        saved_shots,
+                        move_note
+                    ),
+                };
             } else {
-                self.status_line = format!(
-                    "Сохранено: {}{}",
-                    sheet_path.display(),
-                    move_note
-                );
+                self.status_line = match lang {
+                    Language::Ru => format!("Сохранено: {}{}", sheet_path.display(), move_note),
+                    Language::En => format!("Saved: {}{}", sheet_path.display(), move_note),
+                };
             }
         }
     }
 
     fn save_all_to_folder(&mut self) {
+        let lang = self.lang();
         let ready_count = self
             .videos
             .iter()
@@ -2385,7 +2649,7 @@ impl ScreenlistApp {
 
                     if move_video {
                         let dst_video_path = video_folder.join(&video.file_name);
-                        match move_video_file(&video.path, &dst_video_path) {
+                        match move_video_file(&video.path, &dst_video_path, lang) {
                             Ok(()) => {
                                 video.path = dst_video_path;
                                 moved_videos += 1;
@@ -2400,34 +2664,62 @@ impl ScreenlistApp {
 
             let move_summary = if move_video {
                 if move_errors == 0 {
-                    format!(", перенесено видео: {moved_videos}")
+                    match lang {
+                        Language::Ru => format!(", перенесено видео: {moved_videos}"),
+                        Language::En => format!(", moved videos: {moved_videos}"),
+                    }
                 } else {
-                    format!(", перенесено видео: {moved_videos} (ошибок переноса: {move_errors})")
+                    match lang {
+                        Language::Ru => format!(
+                            ", перенесено видео: {moved_videos} (ошибок переноса: {move_errors})"
+                        ),
+                        Language::En => format!(
+                            ", moved videos: {moved_videos} (move errors: {move_errors})"
+                        ),
+                    }
                 }
             } else {
                 String::new()
             };
 
             if saved_screenshots > 0 {
-                self.status_line = format!(
-                    "Сохранено {} скринлистов и {} скриншотов{} (по отдельным папкам) в {}",
-                    saved_sheets,
-                    saved_screenshots,
-                    move_summary,
-                    folder.display()
-                );
+                self.status_line = match lang {
+                    Language::Ru => format!(
+                        "Сохранено {} скринлистов и {} скриншотов{} (по отдельным папкам) в {}",
+                        saved_sheets,
+                        saved_screenshots,
+                        move_summary,
+                        folder.display()
+                    ),
+                    Language::En => format!(
+                        "Saved {} screenlists and {} screenshots{} (in separate folders) to {}",
+                        saved_sheets,
+                        saved_screenshots,
+                        move_summary,
+                        folder.display()
+                    ),
+                };
             } else {
-                self.status_line = format!(
-                    "Сохранено {} скринлистов{} (по отдельным папкам) в {}",
-                    saved_sheets,
-                    move_summary,
-                    folder.display()
-                );
+                self.status_line = match lang {
+                    Language::Ru => format!(
+                        "Сохранено {} скринлистов{} (по отдельным папкам) в {}",
+                        saved_sheets,
+                        move_summary,
+                        folder.display()
+                    ),
+                    Language::En => format!(
+                        "Saved {} screenlists{} (in separate folders) to {}",
+                        saved_sheets,
+                        move_summary,
+                        folder.display()
+                    ),
+                };
             }
         }
     }
 
     fn save_all_to_zip(&mut self) {
+        let lang = self.lang();
         let ready_videos: Vec<&VideoItem> = self
             .videos
             .iter()
@@ -2480,33 +2772,59 @@ impl ScreenlistApp {
             match export_images_to_zip(&entries, &zip_path, self.params.jpeg_quality) {
                 Ok(()) => {
                     if total_shots > 0 {
-                        self.status_line = format!(
-                            "ZIP-архив ({} папок: скринлисты + {} скриншотов) создан за {:.2} сек: {}",
-                            ready_videos.len(),
-                            total_shots,
-                            started.elapsed().as_secs_f64(),
-                            zip_path.display()
-                        );
+                        self.status_line = match lang {
+                            Language::Ru => format!(
+                                "ZIP-архив ({} папок: скринлисты + {} скриншотов) создан за {:.2} сек: {}",
+                                ready_videos.len(),
+                                total_shots,
+                                started.elapsed().as_secs_f64(),
+                                zip_path.display()
+                            ),
+                            Language::En => format!(
+                                "ZIP archive ({} folders: screenlists + {} screenshots) created in {:.2} sec: {}",
+                                ready_videos.len(),
+                                total_shots,
+                                started.elapsed().as_secs_f64(),
+                                zip_path.display()
+                            ),
+                        };
                     } else {
-                        self.status_line = format!(
-                            "ZIP-архив ({} папок) создан за {:.2} сек: {}",
-                            ready_videos.len(),
-                            started.elapsed().as_secs_f64(),
-                            zip_path.display()
-                        );
+                        self.status_line = match lang {
+                            Language::Ru => format!(
+                                "ZIP-архив ({} папок) создан за {:.2} сек: {}",
+                                ready_videos.len(),
+                                started.elapsed().as_secs_f64(),
+                                zip_path.display()
+                            ),
+                            Language::En => format!(
+                                "ZIP archive ({} folders) created in {:.2} sec: {}",
+                                ready_videos.len(),
+                                started.elapsed().as_secs_f64(),
+                                zip_path.display()
+                            ),
+                        };
                     }
                 }
                 Err(error) => {
-                    self.status_line = format!("Ошибка создания ZIP: {error}");
+                    self.status_line = match lang {
+                        Language::Ru => format!("Ошибка создания ZIP: {error}"),
+                        Language::En => format!("ZIP creation error: {error}"),
+                    };
                 }
             }
         }
     }
 
     fn show_top_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut layout_changed = false;
+        let prev_lang = self.params.lang;
+
         ui.horizontal(|ui| {
             ui.heading(
-                egui::RichText::new("⚡ Генератор скринлиста PRO")
+                egui::RichText::new(self.tr(
+                    "⚡ Генератор скринлиста PRO",
+                    "⚡ Screenlist Generator PRO",
+                ))
                     .size(20.0)
                     .strong()
                     .color(egui::Color32::from_rgb(130, 170, 255)),
@@ -2518,6 +2836,13 @@ impl ScreenlistApp {
                     .color(egui::Color32::GRAY),
             );
 
+            ui.separator();
+            ui.label("🌐");
+            ui.selectable_value(&mut self.params.lang, Language::Ru, "RU")
+                .on_hover_text("Русский язык");
+            ui.selectable_value(&mut self.params.lang, Language::En, "EN")
+                .on_hover_text("English language");
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let elapsed = if let Some(started) = self.batch_start_instant {
                     started.elapsed().as_secs_f64()
@@ -2527,8 +2852,13 @@ impl ScreenlistApp {
                     0.0
                 };
 
+                let timer_text = match self.params.lang {
+                    Language::Ru => format!("⏱ {:.3} сек", elapsed),
+                    Language::En => format!("⏱ {:.3} sec", elapsed),
+                };
+
                 ui.label(
-                    egui::RichText::new(format!("⏱ {:.3} сек", elapsed))
+                    egui::RichText::new(timer_text)
                         .font(egui::FontId::monospace(14.0))
                         .strong()
                         .color(egui::Color32::from_rgb(80, 240, 160)),
@@ -2536,18 +2866,40 @@ impl ScreenlistApp {
             });
         });
 
+        if self.params.lang != prev_lang {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+                self.params
+                    .lang
+                    .tr("⚡ Генератор скринлиста PRO", "⚡ Screenlist Generator PRO")
+                    .to_owned(),
+            ));
+
+            if self.videos.is_empty() && !self.is_processing {
+                self.status_line = self
+                    .params
+                    .lang
+                    .tr(
+                        "Готов к работе. Добавьте видео, выберите папку или перетащите их в окно.",
+                        "Ready. Add videos, select a folder, or drag & drop files into the window.",
+                    )
+                    .to_owned();
+            } else {
+                layout_changed = true;
+            }
+        }
+
+        let lang = self.lang();
+
         ui.label(
-            egui::RichText::new(self.topology.description())
+            egui::RichText::new(self.topology.description(lang))
                 .size(12.0)
                 .color(egui::Color32::LIGHT_GRAY),
         );
 
         ui.separator();
 
-        let mut layout_changed = false;
-
         ui.horizontal_wrapped(|ui| {
-            ui.label("Кадров:");
+            ui.label(lang.tr("Кадров:", "Frames:"));
             ui.add_enabled(
                 !self.is_processing,
                 egui::DragValue::new(&mut self.params.frame_count)
@@ -2556,15 +2908,18 @@ impl ScreenlistApp {
             );
 
             ui.separator();
-            ui.label("Скриншотов:");
+            ui.label(lang.tr("Скриншотов:", "Screenshots:"));
             ui.add_enabled(
                 !self.is_processing,
                 egui::Slider::new(&mut self.params.screenshot_count, 0..=10),
             )
-                .on_hover_text("Количество отдельных полноразмерных скриншотов (от 0 до 10)");
+                .on_hover_text(lang.tr(
+                    "Количество отдельных полноразмерных скриншотов (от 0 до 10)",
+                    "Number of standalone full-resolution screenshots (0 to 10)",
+                ));
 
             ui.separator();
-            ui.label("Колонок:");
+            ui.label(lang.tr("Колонок:", "Columns:"));
             if ui
                 .add_enabled(
                     !self.is_processing,
@@ -2576,7 +2931,7 @@ impl ScreenlistApp {
             }
 
             ui.separator();
-            ui.label("Ширина:");
+            ui.label(lang.tr("Ширина:", "Width:"));
             if ui
                 .add_enabled(
                     !self.is_processing,
@@ -2590,38 +2945,40 @@ impl ScreenlistApp {
             }
 
             ui.separator();
-            ui.label("Режим ядер:");
+            ui.label(lang.tr("Режим ядер:", "Core mode:"));
 
             if self.topology.is_hybrid() {
                 if !self.is_processing {
                     ui.selectable_value(
                         &mut self.params.core_mode,
                         CoreMode::Auto,
-                        "Авто P и E",
+                        lang.tr("Авто P и E", "Auto P & E"),
                     )
-                        .on_hover_text("Сначала P-ядра, затем E-ядра.");
+                        .on_hover_text(
+                            lang.tr("Сначала P-ядра, затем E-ядра.", "P-cores first, then E-cores."),
+                        );
 
                     ui.selectable_value(
                         &mut self.params.core_mode,
                         CoreMode::POnly,
-                        "Только P",
+                        lang.tr("Только P", "P Only"),
                     );
 
                     ui.selectable_value(
                         &mut self.params.core_mode,
                         CoreMode::EOnly,
-                        "Только E",
+                        lang.tr("Только E", "E Only"),
                     );
                 } else {
                     let mode_name = match self.params.core_mode {
-                        CoreMode::Auto => "Авто P и E",
-                        CoreMode::POnly => "Только P",
-                        CoreMode::EOnly => "Только E",
+                        CoreMode::Auto => lang.tr("Авто P и E", "Auto P & E"),
+                        CoreMode::POnly => lang.tr("Только P", "P Only"),
+                        CoreMode::EOnly => lang.tr("Только E", "E Only"),
                     };
                     ui.label(mode_name);
                 }
             } else {
-                ui.label("Авто");
+                ui.label(lang.tr("Авто", "Auto"));
             }
 
             let max_workers = self
@@ -2634,7 +2991,10 @@ impl ScreenlistApp {
             }
 
             ui.separator();
-            ui.label(format!("Воркеры: {}", self.params.workers));
+            ui.label(match lang {
+                Language::Ru => format!("Воркеры: {}", self.params.workers),
+                Language::En => format!("Workers: {}", self.params.workers),
+            });
             ui.add_enabled(
                 !self.is_processing,
                 egui::Slider::new(&mut self.params.workers, 1..=max_workers),
@@ -2646,34 +3006,46 @@ impl ScreenlistApp {
                     .build_worker_slots(self.params.workers, self.params.core_mode)
                     .len();
 
-                ui.label(format!("активно: {effective}"));
+                ui.label(match lang {
+                    Language::Ru => format!("активно: {effective}"),
+                    Language::En => format!("active: {effective}"),
+                });
             }
 
             ui.separator();
             if ui
-                .checkbox(&mut self.params.show_timestamps, "Тайм-коды")
+                .checkbox(
+                    &mut self.params.show_timestamps,
+                    lang.tr("Тайм-коды", "Timestamps"),
+                )
                 .changed()
             {
                 layout_changed = true;
             }
 
-            ui.checkbox(&mut self.params.turbo_keyframe, "Турбо (I-Frame)")
-                .on_hover_text(
+            ui.checkbox(
+                &mut self.params.turbo_keyframe,
+                lang.tr("Турбо (I-Frame)", "Turbo (I-Frame)"),
+            )
+                .on_hover_text(lang.tr(
                     "AVDISCARD_NONKEY: декодирует только ключевые кадры напрямую через C libavcodec.",
-                );
+                    "AVDISCARD_NONKEY: decodes keyframes only directly via C libavcodec.",
+                ));
 
             ui.checkbox(&mut self.params.hwaccel, "GPU")
-                .on_hover_text(
+                .on_hover_text(lang.tr(
                     "Аппаратное декодирование через C libavutil hwcontext с откатом на CPU.",
-                );
+                    "Hardware decoding via C libavutil hwcontext with CPU fallback.",
+                ));
 
             ui.checkbox(
                 &mut self.params.move_video_to_folder,
-                "Переносить видео в папку",
+                lang.tr("Переносить видео в папку", "Move video to folder"),
             )
-                .on_hover_text(
+                .on_hover_text(lang.tr(
                     "При сохранении переносить исходный видеофайл в его отдельную папку вместе со скринлистом и скриншотами.",
-                );
+                    "When saving, move the source video file into its dedicated folder alongside the screenlist and screenshots.",
+                ));
         });
 
         if layout_changed {
@@ -2692,11 +3064,14 @@ impl ScreenlistApp {
 
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!self.is_processing, egui::Button::new("➕ Добавить видео"))
+                .add_enabled(
+                    !self.is_processing,
+                    egui::Button::new(lang.tr("➕ Добавить видео", "➕ Add Videos")),
+                )
                 .clicked()
             {
                 if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("Видео файлы", VIDEO_EXTENSIONS)
+                    .add_filter(lang.tr("Видео файлы", "Video Files"), VIDEO_EXTENSIONS)
                     .pick_files()
                 {
                     self.add_video_paths(files);
@@ -2704,8 +3079,14 @@ impl ScreenlistApp {
             }
 
             if ui
-                .add_enabled(!self.is_processing, egui::Button::new("📁 Добавить папку"))
-                .on_hover_text("Найти все видеофайлы в выбранной папке и во всех её подпапках")
+                .add_enabled(
+                    !self.is_processing,
+                    egui::Button::new(lang.tr("📁 Добавить папку", "📁 Add Folder")),
+                )
+                .on_hover_text(lang.tr(
+                    "Найти все видеофайлы в выбранной папке и во всех её подпапках",
+                    "Find all video files in the selected folder and all its subfolders",
+                ))
                 .clicked()
             {
                 if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -2717,7 +3098,9 @@ impl ScreenlistApp {
                 .add_enabled(
                     !self.is_processing && !self.videos.is_empty(),
                     egui::Button::new(
-                        egui::RichText::new("🚀 Создать для всех видео")
+                        egui::RichText::new(
+                            lang.tr("🚀 Создать для всех видео", "🚀 Generate All"),
+                        )
                             .strong()
                             .color(egui::Color32::WHITE),
                     )
@@ -2733,7 +3116,10 @@ impl ScreenlistApp {
                 if ui
                     .add_enabled(
                         !self.is_processing && active < self.videos.len(),
-                        egui::Button::new("🎬 Создать для выбранного видео"),
+                        egui::Button::new(lang.tr(
+                            "🎬 Создать для выбранного видео",
+                            "🎬 Generate Selected",
+                        )),
                     )
                     .clicked()
                 {
@@ -2754,27 +3140,32 @@ impl ScreenlistApp {
                 .count();
 
             if ui
-                .add_enabled(has_current_sheet, egui::Button::new("💾 Сохранить текущий"))
+                .add_enabled(
+                    has_current_sheet,
+                    egui::Button::new(lang.tr("💾 Сохранить текущий", "💾 Save Current")),
+                )
                 .clicked()
             {
                 self.save_current_sheet();
             }
 
+            let save_folder_label = match lang {
+                Language::Ru => format!("📂 Сохранить в папку ({ready_sheets})"),
+                Language::En => format!("📂 Save to Folder ({ready_sheets})"),
+            };
             if ui
-                .add_enabled(
-                    ready_sheets > 0,
-                    egui::Button::new(format!("📂 Сохранить в папку ({ready_sheets})")),
-                )
+                .add_enabled(ready_sheets > 0, egui::Button::new(save_folder_label))
                 .clicked()
             {
                 self.save_all_to_folder();
             }
 
+            let save_zip_label = match lang {
+                Language::Ru => format!("📦 Создать ZIP ({ready_sheets})"),
+                Language::En => format!("📦 Create ZIP ({ready_sheets})"),
+            };
             if ui
-                .add_enabled(
-                    ready_sheets > 0,
-                    egui::Button::new(format!("📦 Создать ZIP ({ready_sheets})")),
-                )
+                .add_enabled(ready_sheets > 0, egui::Button::new(save_zip_label))
                 .clicked()
             {
                 self.save_all_to_zip();
@@ -2783,7 +3174,7 @@ impl ScreenlistApp {
             if ui
                 .add_enabled(
                     !self.is_processing && !self.videos.is_empty(),
-                    egui::Button::new("🗑 Очистить список"),
+                    egui::Button::new(lang.tr("🗑 Очистить список", "🗑 Clear Queue")),
                 )
                 .clicked()
             {
@@ -2797,7 +3188,7 @@ impl ScreenlistApp {
                 self.current_total_frames = 0;
                 self.batch_start_instant = None;
                 self.last_elapsed = None;
-                self.status_line = "Список очищен.".to_owned();
+                self.status_line = lang.tr("Список очищен.", "Queue cleared.").to_owned();
             }
         });
 
@@ -2820,14 +3211,24 @@ impl ScreenlistApp {
             }
                 .clamp(0.0, 1.0);
 
+            let overall_text = match lang {
+                Language::Ru => format!(
+                    "Общий прогресс: {} / {} видео ({:.0}%)",
+                    done_videos,
+                    total_videos,
+                    overall_ratio * 100.0
+                ),
+                Language::En => format!(
+                    "Overall progress: {} / {} videos ({:.0}%)",
+                    done_videos,
+                    total_videos,
+                    overall_ratio * 100.0
+                ),
+            };
+
             ui.add(
                 egui::ProgressBar::new(overall_ratio)
-                    .text(format!(
-                        "Общий прогресс: {} / {} видео ({:.0}%)",
-                        done_videos,
-                        total_videos,
-                        overall_ratio * 100.0
-                    ))
+                    .text(overall_text)
                     .animate(self.is_processing),
             );
 
@@ -2839,12 +3240,20 @@ impl ScreenlistApp {
                 0.0
             };
 
+            let frame_progress_text = match lang {
+                Language::Ru => format!(
+                    "{} (кадры: {} / {})",
+                    self.status_line, self.current_done_frames, self.current_total_frames
+                ),
+                Language::En => format!(
+                    "{} (frames: {} / {})",
+                    self.status_line, self.current_done_frames, self.current_total_frames
+                ),
+            };
+
             ui.add(
                 egui::ProgressBar::new(current_ratio)
-                    .text(format!(
-                        "{} (кадры: {} / {})",
-                        self.status_line, self.current_done_frames, self.current_total_frames
-                    ))
+                    .text(frame_progress_text)
                     .animate(self.is_processing),
             );
         } else {
@@ -3098,17 +3507,30 @@ fn compose_contact_sheet(
             true,
         );
 
-        let info = format!(
-            "{} | {}×{} | {} | {} кадров | Кадр: {}×{}px | Сетка: {}",
-            format_duration(duration),
-            video_w,
-            video_h,
-            format_file_size(file_size),
-            frames.len(),
-            thumb_w,
-            thumb_h,
-            format_columns_word(cols as usize)
-        );
+        let info = match params.lang {
+            Language::Ru => format!(
+                "{} | {}×{} | {} | {} кадров | Кадр: {}×{}px | Сетка: {}",
+                format_duration(duration),
+                video_w,
+                video_h,
+                format_file_size_lang(file_size, params.lang),
+                frames.len(),
+                thumb_w,
+                thumb_h,
+                format_columns_word_lang(cols as usize, params.lang)
+            ),
+            Language::En => format!(
+                "{} | {}×{} | {} | {} frames | Frame: {}×{}px | Grid: {}",
+                format_duration(duration),
+                video_w,
+                video_h,
+                format_file_size_lang(file_size, params.lang),
+                frames.len(),
+                thumb_w,
+                thumb_h,
+                format_columns_word_lang(cols as usize, params.lang)
+            ),
+        };
 
         draw_text_rgb(
             &mut canvas,
@@ -3306,22 +3728,31 @@ fn is_same_file_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn move_video_file(src: &Path, dst: &Path) -> Result<(), String> {
+fn move_video_file(src: &Path, dst: &Path, lang: Language) -> Result<(), String> {
     if is_same_file_path(src, dst) {
         return Ok(());
     }
 
     if !src.exists() {
-        return Err(format!("Исходный файл не найден: {}", src.display()));
+        return Err(match lang {
+            Language::Ru => format!("Исходный файл не найден: {}", src.display()),
+            Language::En => format!("Source file not found: {}", src.display()),
+        });
     }
 
     if fs::rename(src, dst).is_ok() {
         return Ok(());
     }
 
-    fs::copy(src, dst).map_err(|error| format!("Не удалось скопировать видео: {error}"))?;
-    fs::remove_file(src).map_err(|error| {
-        format!("Видео скопировано, но не удалось удалить исходный файл: {error}")
+    fs::copy(src, dst).map_err(|error| match lang {
+        Language::Ru => format!("Не удалось скопировать видео: {error}"),
+        Language::En => format!("Failed to copy video: {error}"),
+    })?;
+    fs::remove_file(src).map_err(|error| match lang {
+        Language::Ru => {
+            format!("Видео скопировано, но не удалось удалить исходный файл: {error}")
+        }
+        Language::En => format!("Video copied, but failed to remove source file: {error}"),
     })?;
 
     Ok(())
@@ -3463,27 +3894,44 @@ fn format_duration(seconds: f64) -> String {
     }
 }
 
-fn format_file_size(bytes: u64) -> String {
+fn format_file_size_lang(bytes: u64, lang: Language) -> String {
     let megabytes = bytes as f64 / (1024.0 * 1024.0);
 
     if megabytes >= 1024.0 {
-        format!("{:.2} ГБ", megabytes / 1024.0)
+        match lang {
+            Language::Ru => format!("{:.2} ГБ", megabytes / 1024.0),
+            Language::En => format!("{:.2} GB", megabytes / 1024.0),
+        }
     } else {
-        format!("{:.1} МБ", megabytes)
+        match lang {
+            Language::Ru => format!("{:.1} МБ", megabytes),
+            Language::En => format!("{:.1} MB", megabytes),
+        }
     }
 }
 
-fn format_columns_word(columns: usize) -> String {
-    let mod10 = columns % 10;
-    let mod100 = columns % 100;
+fn format_columns_word_lang(columns: usize, lang: Language) -> String {
+    match lang {
+        Language::Ru => {
+            let mod10 = columns % 10;
+            let mod100 = columns % 100;
 
-    let word = if mod10 == 1 && mod100 != 11 {
-        "колонка"
-    } else if (2..=4).contains(&mod10) && !(12..=14).contains(&mod100) {
-        "колонки"
-    } else {
-        "колонок"
-    };
+            let word = if mod10 == 1 && mod100 != 11 {
+                "колонка"
+            } else if (2..=4).contains(&mod10) && !(12..=14).contains(&mod100) {
+                "колонки"
+            } else {
+                "колонок"
+            };
 
-    format!("{} {}", columns, word)
+            format!("{} {}", columns, word)
+        }
+        Language::En => {
+            if columns == 1 {
+                "1 column".to_owned()
+            } else {
+                format!("{columns} columns")
+            }
+        }
+    }
 }
