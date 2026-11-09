@@ -4,6 +4,7 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use eframe::egui;
 use image::{codecs::jpeg::JpegEncoder, Rgb, RgbImage};
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -65,6 +66,12 @@ enum VideoStatus {
     Error(String),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewTab {
+    Screenlist,
+    Screenshots,
+}
+
 struct VideoItem {
     path: PathBuf,
     file_name: String,
@@ -76,6 +83,9 @@ struct VideoItem {
     audio_info_line: String,
     status: VideoStatus,
     frames: Vec<CapturedFrame>,
+    screenshots: Vec<CapturedFrame>,
+    active_screenshot_idx: usize,
+    screenshot_texture: Option<(usize, egui::TextureHandle)>,
     sheet_image: Option<RgbImage>,
     sheet_texture: Option<egui::TextureHandle>,
     last_cols: usize,
@@ -93,6 +103,7 @@ enum CoreMode {
 #[derive(Clone, Copy)]
 struct RenderParams {
     frame_count: usize,
+    screenshot_count: usize,
     columns: usize,
     grid_width: u32,
     workers: usize,
@@ -100,6 +111,7 @@ struct RenderParams {
     show_timestamps: bool,
     turbo_keyframe: bool,
     hwaccel: bool,
+    move_video_to_folder: bool,
     jpeg_quality: u8,
 }
 
@@ -946,6 +958,7 @@ enum WorkerMsg {
     VideoFinished {
         video_idx: usize,
         frames: Vec<CapturedFrame>,
+        screenshots: Vec<CapturedFrame>,
         sheet: RgbImage,
         elapsed: Duration,
         cols: usize,
@@ -976,6 +989,7 @@ enum WorkerMsg {
 struct ScreenlistApp {
     videos: Vec<VideoItem>,
     active_idx: Option<usize>,
+    active_tab: PreviewTab,
     params: RenderParams,
     topology: CpuTopology,
 
@@ -1007,8 +1021,10 @@ impl ScreenlistApp {
         Self {
             videos: Vec::new(),
             active_idx: None,
+            active_tab: PreviewTab::Screenlist,
             params: RenderParams {
                 frame_count: 32,
+                screenshot_count: 4,
                 columns: 4,
                 grid_width: 1200,
                 workers,
@@ -1016,6 +1032,7 @@ impl ScreenlistApp {
                 show_timestamps: true,
                 turbo_keyframe: true,
                 hwaccel: false,
+                move_video_to_folder: false,
                 jpeg_quality: 85,
             },
             topology,
@@ -1087,6 +1104,9 @@ impl ScreenlistApp {
                         audio_info_line: probed.audio_info_line,
                         status: VideoStatus::Ready,
                         frames: Vec::new(),
+                        screenshots: Vec::new(),
+                        active_screenshot_idx: 0,
+                        screenshot_texture: None,
                         sheet_image: None,
                         sheet_texture: None,
                         last_cols: self.params.columns,
@@ -1155,7 +1175,8 @@ impl ScreenlistApp {
         self.batch_error_count = 0;
         self.last_batch_error = None;
         self.current_done_frames = 0;
-        self.current_total_frames = self.params.frame_count.max(1);
+        self.current_total_frames =
+            self.params.frame_count.max(1) + self.params.screenshot_count.min(10);
         self.batch_start_instant = Some(Instant::now());
 
         let params = self.params;
@@ -1212,6 +1233,8 @@ impl ScreenlistApp {
                 let decode_w = thumb_w.min(width).max(64);
                 let decode_h = thumb_h.min(height).max(36);
                 let total_frames = params.frame_count.max(1);
+                let screenshot_count = params.screenshot_count.min(10);
+                let total_work_frames = total_frames + screenshot_count;
 
                 let safe_end = (duration - 0.05).max(duration * 0.90).max(0.0);
                 let step = safe_end / (total_frames as f64 + 1.0);
@@ -1260,7 +1283,7 @@ impl ScreenlistApp {
                                     params.hwaccel,
                                     slot,
                                     &done_counter,
-                                    total_frames,
+                                    total_work_frames,
                                     video_idx,
                                     &tx,
                                 )
@@ -1269,68 +1292,129 @@ impl ScreenlistApp {
                             .collect()
                     });
 
-                match extracted {
+                let parts = match extracted {
                     Err(error) => {
                         let _ = tx.send(WorkerMsg::VideoError { video_idx, error });
+                        continue;
                     }
-                    Ok(parts) => {
-                        let mut indexed_frames = Vec::with_capacity(total_frames);
-                        let mut p_frames = 0usize;
-                        let mut e_frames = 0usize;
+                    Ok(parts) => parts,
+                };
 
-                        for (is_p_core, part) in parts {
-                            if topology.is_hybrid() {
-                                if is_p_core {
-                                    p_frames += part.len();
-                                } else {
-                                    e_frames += part.len();
-                                }
-                            }
+                let mut indexed_frames = Vec::with_capacity(total_frames);
+                let mut p_frames = 0usize;
+                let mut e_frames = 0usize;
 
-                            indexed_frames.extend(part);
+                for (is_p_core, part) in parts {
+                    if topology.is_hybrid() {
+                        if is_p_core {
+                            p_frames += part.len();
+                        } else {
+                            e_frames += part.len();
                         }
+                    }
 
-                        if indexed_frames.len() != total_frames {
-                            let _ = tx.send(WorkerMsg::VideoError {
-                                video_idx,
-                                error: format!(
-                                    "Получено {} кадров вместо {}.",
-                                    indexed_frames.len(),
-                                    total_frames
-                                ),
-                            });
+                    indexed_frames.extend(part);
+                }
+
+                if indexed_frames.len() != total_frames {
+                    let _ = tx.send(WorkerMsg::VideoError {
+                        video_idx,
+                        error: format!(
+                            "Получено {} кадров вместо {}.",
+                            indexed_frames.len(),
+                            total_frames
+                        ),
+                    });
+                    continue;
+                }
+
+                indexed_frames.sort_by_key(|(frame_idx, _)| *frame_idx);
+                let frames: Vec<CapturedFrame> =
+                    indexed_frames.into_iter().map(|(_, frame)| frame).collect();
+
+                // Извлечение полноразмерных скриншотов (от 0 до 10)
+                let mut screenshots = Vec::with_capacity(screenshot_count);
+                if screenshot_count > 0 {
+                    let full_w = width.max(64);
+                    let full_h = height.max(36);
+                    let ss_step = safe_end / (screenshot_count as f64 + 1.0);
+                    let ss_timestamps: Vec<Vec<(usize, f64)>> = (0..screenshot_count)
+                        .map(|index| vec![(index, ss_step * (index as f64 + 1.0))])
+                        .collect();
+
+                    let ss_extracted: Result<Vec<(bool, Vec<(usize, CapturedFrame)>)>, String> =
+                        pool.install(|| {
+                            ss_timestamps
+                                .par_iter()
+                                .map(|chunk| {
+                                    let worker_idx = rayon::current_thread_index().unwrap_or(0);
+                                    let slot = slots[worker_idx % slots.len()];
+
+                                    extract_chunk_frames_rgb(
+                                        &path,
+                                        chunk,
+                                        full_w,
+                                        full_h,
+                                        params.turbo_keyframe,
+                                        params.hwaccel,
+                                        slot,
+                                        &done_counter,
+                                        total_work_frames,
+                                        video_idx,
+                                        &tx,
+                                    )
+                                        .map(|ss_part| (slot.is_p_core, ss_part))
+                                })
+                                .collect()
+                        });
+
+                    match ss_extracted {
+                        Err(error) => {
+                            let _ = tx.send(WorkerMsg::VideoError { video_idx, error });
                             continue;
                         }
-
-                        indexed_frames.sort_by_key(|(frame_idx, _)| *frame_idx);
-                        let frames: Vec<CapturedFrame> =
-                            indexed_frames.into_iter().map(|(_, frame)| frame).collect();
-
-                        let (sheet, sheet_thumb_w, sheet_thumb_h) = compose_contact_sheet(
-                            &file_name,
-                            file_size,
-                            duration,
-                            width,
-                            height,
-                            &frames,
-                            params,
-                            &font_bytes,
-                        );
-
-                        total_p_frames += p_frames;
-                        total_e_frames += e_frames;
-
-                        let _ = tx.send(WorkerMsg::VideoFinished {
-                            video_idx,
-                            frames,
-                            sheet,
-                            elapsed: video_t0.elapsed(),
-                            cols: params.columns,
-                            thumb_w: sheet_thumb_w,
-                            thumb_h: sheet_thumb_h,
-                        });
+                        Ok(ss_parts) => {
+                            let mut indexed_ss = Vec::with_capacity(screenshot_count);
+                            for (is_p_core, part) in ss_parts {
+                                if topology.is_hybrid() {
+                                    if is_p_core {
+                                        p_frames += part.len();
+                                    } else {
+                                        e_frames += part.len();
+                                    }
+                                }
+                                indexed_ss.extend(part);
+                            }
+                            indexed_ss.sort_by_key(|(idx, _)| *idx);
+                            screenshots = indexed_ss.into_iter().map(|(_, frame)| frame).collect();
+                        }
                     }
                 }
+
+                let (sheet, sheet_thumb_w, sheet_thumb_h) = compose_contact_sheet(
+                    &file_name,
+                    file_size,
+                    duration,
+                    width,
+                    height,
+                    &frames,
+                    params,
+                    &font_bytes,
+                );
+
+                total_p_frames += p_frames;
+                total_e_frames += e_frames;
+
+                let _ = tx.send(WorkerMsg::VideoFinished {
+                    video_idx,
+                    frames,
+                    screenshots,
+                    sheet,
+                    elapsed: video_t0.elapsed(),
+                    cols: params.columns,
+                    thumb_w: sheet_thumb_w,
+                    thumb_h: sheet_thumb_h,
+                });
             }
 
             let _ = tx.send(WorkerMsg::BatchComplete {
@@ -1417,6 +1501,7 @@ impl ScreenlistApp {
         for (index, video) in self.videos.iter_mut().enumerate() {
             if self.active_idx != Some(index) {
                 video.sheet_texture = None;
+                video.screenshot_texture = None;
             }
         }
     }
@@ -1539,7 +1624,8 @@ impl ScreenlistApp {
                     self.active_idx = Some(video_idx);
                     self.release_inactive_sheet_textures();
                     self.current_done_frames = 0;
-                    self.current_total_frames = self.params.frame_count.max(1);
+                    self.current_total_frames =
+                        self.params.frame_count.max(1) + self.params.screenshot_count.min(10);
 
                     if let Some(video) = self.videos.get_mut(video_idx) {
                         video.status = VideoStatus::Processing;
@@ -1566,6 +1652,7 @@ impl ScreenlistApp {
                 WorkerMsg::VideoFinished {
                     video_idx,
                     frames,
+                    screenshots,
                     sheet,
                     elapsed,
                     cols,
@@ -1582,6 +1669,9 @@ impl ScreenlistApp {
                         };
                         video.sheet_image = Some(sheet);
                         video.frames = frames;
+                        video.screenshots = screenshots;
+                        video.active_screenshot_idx = 0;
+                        video.screenshot_texture = None;
                         video.status = VideoStatus::Done(elapsed);
                         video.last_cols = cols;
                         video.last_thumb_w = thumb_w;
@@ -1786,10 +1876,16 @@ impl ScreenlistApp {
                                 );
                             }
                             VideoStatus::Done(elapsed) => {
+                                let ss_info = if !video.screenshots.is_empty() {
+                                    format!(" (+{} скринш.)", video.screenshots.len())
+                                } else {
+                                    String::new()
+                                };
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "✅ Готово за {:.3} сек",
-                                        elapsed.as_secs_f64()
+                                        "✅ Готово за {:.3} сек{}",
+                                        elapsed.as_secs_f64(),
+                                        ss_info
                                     ))
                                         .color(egui::Color32::from_rgb(80, 230, 145)),
                                 );
@@ -1833,6 +1929,46 @@ impl ScreenlistApp {
         }
 
         self.release_inactive_sheet_textures();
+    }
+
+    fn show_preview_panel(&mut self, ui: &mut egui::Ui) -> Option<(usize, usize)> {
+        let ss_count = self
+            .active_idx
+            .and_then(|idx| self.videos.get(idx))
+            .map(|v| v.screenshots.len())
+            .unwrap_or(0);
+
+        // Вкладки выбора между Скринлистом и Скриншотами над превью
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.active_tab,
+                PreviewTab::Screenlist,
+                egui::RichText::new("📋 Скринлист").size(14.5).strong(),
+            );
+
+            ui.add_space(6.0);
+
+            let ss_tab_title = if ss_count > 0 {
+                format!("🖼 Скриншоты ({})", ss_count)
+            } else {
+                "🖼 Скриншоты".to_owned()
+            };
+
+            ui.selectable_value(
+                &mut self.active_tab,
+                PreviewTab::Screenshots,
+                egui::RichText::new(ss_tab_title).size(14.5).strong(),
+            );
+        });
+        ui.separator();
+
+        match self.active_tab {
+            PreviewTab::Screenlist => self.show_active_sheet(ui),
+            PreviewTab::Screenshots => {
+                self.show_active_screenshots(ui);
+                None
+            }
+        }
     }
 
     fn show_active_sheet(&mut self, ui: &mut egui::Ui) -> Option<(usize, usize)> {
@@ -1927,6 +2063,159 @@ impl ScreenlistApp {
         frame_to_shift
     }
 
+    fn show_active_screenshots(&mut self, ui: &mut egui::Ui) {
+        let Some(active_idx) = self.active_idx else {
+            ui.centered_and_justified(|ui| {
+                ui.label("Добавьте видео или папку, чтобы создать скриншоты.");
+            });
+            return;
+        };
+
+        let Some(video) = self.videos.get_mut(active_idx) else {
+            ui.centered_and_justified(|ui| {
+                ui.label("Видео не выбрано.");
+            });
+            return;
+        };
+
+        if video.screenshots.is_empty() {
+            ui.centered_and_justified(|ui| {
+                if self.params.screenshot_count == 0 {
+                    ui.label(
+                        "Количество полноразмерных скриншотов установлено в 0. Укажите от 1 до 10 сверху и запустите генерацию.",
+                    );
+                } else {
+                    ui.label("Нажмите «Создать скринлист», чтобы сгенерировать полноразмерные скриншоты.");
+                }
+            });
+            return;
+        }
+
+        let total = video.screenshots.len();
+        if video.active_screenshot_idx >= total {
+            video.active_screenshot_idx = 0;
+        }
+
+        // Поддержка перелистывания клавишами влево/вправо
+        if total > 1 {
+            if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                video.active_screenshot_idx = (video.active_screenshot_idx + total - 1) % total;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                video.active_screenshot_idx = (video.active_screenshot_idx + 1) % total;
+            }
+        }
+
+        let current_idx = video.active_screenshot_idx;
+        let need_reload = match &video.screenshot_texture {
+            Some((cached_idx, _)) => *cached_idx != current_idx,
+            None => true,
+        };
+
+        if need_reload {
+            if let Some(shot) = video.screenshots.get(current_idx) {
+                let tex_name = format!(
+                    "{}_screenshot_{}",
+                    video.path.to_string_lossy(),
+                    current_idx + 1
+                );
+                let handle = rgb_to_texture(ui.ctx(), &tex_name, &shot.rgb);
+                video.screenshot_texture = Some((current_idx, handle));
+            }
+        }
+
+        let shot_timestamp = video
+            .screenshots
+            .get(current_idx)
+            .map(|s| s.timestamp)
+            .unwrap_or(0.0);
+        let shot_w = video
+            .screenshots
+            .get(current_idx)
+            .map(|s| s.rgb.width())
+            .unwrap_or(video.width);
+        let shot_h = video
+            .screenshots
+            .get(current_idx)
+            .map(|s| s.rgb.height())
+            .unwrap_or(video.height);
+
+        let nav_bar_height = 46.0;
+        let image_area_height = (ui.available_height() - nav_bar_height).max(160.0);
+        let image_area_width = (ui.available_width() - 8.0).max(200.0);
+
+        if let Some((_, texture)) = &video.screenshot_texture {
+            let tex_size = texture.size_vec2();
+            let scale_x = image_area_width / tex_size.x.max(1.0);
+            let scale_y = (image_area_height - 8.0).max(100.0) / tex_size.y.max(1.0);
+            let scale = scale_x.min(scale_y).min(1.0);
+            let display_size = tex_size * scale;
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(image_area_width, image_area_height),
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                |ui| {
+                    ui.add(egui::Image::new((texture.id(), display_size)));
+                },
+            );
+        }
+
+        ui.separator();
+
+        // Нижняя панель навигации под скриншотом: Предыдущий | текущий / всего | Следующий
+        ui.horizontal(|ui| {
+            let prev_clicked = ui
+                .add_enabled(
+                    total > 1,
+                    egui::Button::new(egui::RichText::new("⬅ Предыдущий").size(14.0).strong())
+                        .min_size(egui::vec2(130.0, 30.0)),
+                )
+                .clicked();
+
+            if prev_clicked {
+                video.active_screenshot_idx = (video.active_screenshot_idx + total - 1) % total;
+            }
+
+            ui.add_space(12.0);
+
+            ui.label(
+                egui::RichText::new(format!("{} / {}", current_idx + 1, total))
+                    .size(16.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(130, 195, 255)),
+            );
+
+            ui.add_space(8.0);
+
+            ui.label(
+                egui::RichText::new(format!(
+                    "({}_ScreenShot{} | {} | {}×{})",
+                    stem_name(&video.file_name),
+                    current_idx + 1,
+                    format_duration(shot_timestamp),
+                    shot_w,
+                    shot_h
+                ))
+                    .size(12.5)
+                    .color(egui::Color32::GRAY),
+            );
+
+            ui.add_space(12.0);
+
+            let next_clicked = ui
+                .add_enabled(
+                    total > 1,
+                    egui::Button::new(egui::RichText::new("Следующий ➡").size(14.0).strong())
+                        .min_size(egui::vec2(130.0, 30.0)),
+                )
+                .clicked();
+
+            if next_clicked {
+                video.active_screenshot_idx = (video.active_screenshot_idx + 1) % total;
+            }
+        });
+    }
+
     fn save_current_sheet(&mut self) {
         let Some(active_idx) = self.active_idx else {
             return;
@@ -1938,8 +2227,11 @@ impl ScreenlistApp {
             return;
         }
 
-        let default_name = format!("{}_screenlist.jpg", stem_name(&video.file_name));
+        let base_stem = stem_name(&video.file_name);
+        let folder_name = sanitize_folder_name(&base_stem);
+        let default_name = format!("{}_screenlist.jpg", base_stem);
         let jpeg_quality = self.params.jpeg_quality;
+        let move_video = self.params.move_video_to_folder;
 
         if let Some(path) = rfd::FileDialog::new()
             .set_file_name(&default_name)
@@ -1947,17 +2239,93 @@ impl ScreenlistApp {
             .add_filter("PNG Image", &["png"])
             .save_file()
         {
-            let result = self
-                .videos
-                .get(active_idx)
-                .and_then(|video| video.sheet_image.as_ref())
-                .ok_or_else(|| "Скринлист больше недоступен.".to_owned())
-                .and_then(|image| save_rgb_image(image, &path, jpeg_quality));
+            let Some(video) = self.videos.get_mut(active_idx) else {
+                self.status_line = "Скринлист больше недоступен.".to_owned();
+                return;
+            };
+            let Some(sheet_image) = video.sheet_image.as_ref() else {
+                self.status_line = "Скринлист больше недоступен.".to_owned();
+                return;
+            };
 
-            if let Err(error) = result {
-                self.status_line = format!("Ошибка сохранения: {error}");
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg")
+                .to_lowercase();
+            let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+            // Если пользователь не находится уже внутри папки с названием этого видео,
+            // создаём отдельную папку для этого видео (например, video1/)
+            let already_in_video_dir = parent_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case(&folder_name))
+                .unwrap_or(false);
+
+            let video_dir = if already_in_video_dir {
+                parent_dir.to_path_buf()
             } else {
-                self.status_line = format!("Сохранено: {}", path.display());
+                parent_dir.join(&folder_name)
+            };
+
+            if let Err(error) = fs::create_dir_all(&video_dir) {
+                self.status_line = format!("Ошибка создания папки {}: {error}", video_dir.display());
+                return;
+            }
+
+            let sheet_file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| default_name.clone());
+            let sheet_path = video_dir.join(sheet_file_name);
+
+            if let Err(error) = save_rgb_image(sheet_image, &sheet_path, jpeg_quality) {
+                self.status_line = format!("Ошибка сохранения: {error}");
+                return;
+            }
+
+            let mut saved_shots = 0usize;
+            for (shot_idx, shot) in video.screenshots.iter().enumerate() {
+                let shot_path = video_dir.join(format!(
+                    "{}_ScreenShot{}.{}",
+                    base_stem,
+                    shot_idx + 1,
+                    ext
+                ));
+                if save_rgb_image(&shot.rgb, &shot_path, jpeg_quality).is_ok() {
+                    saved_shots += 1;
+                }
+            }
+
+            let mut move_note = String::new();
+            if move_video {
+                let dst_video_path = video_dir.join(&video.file_name);
+                match move_video_file(&video.path, &dst_video_path) {
+                    Ok(()) => {
+                        video.path = dst_video_path;
+                        move_note = " + видео перенесено".to_owned();
+                    }
+                    Err(err) => {
+                        move_note = format!(" (ошибка переноса видео: {err})");
+                    }
+                }
+            }
+
+            if saved_shots > 0 {
+                self.status_line = format!(
+                    "Сохранено в папку {}: скринлист + {} скриншотов{}",
+                    video_dir.display(),
+                    saved_shots,
+                    move_note
+                );
+            } else {
+                self.status_line = format!(
+                    "Сохранено: {}{}",
+                    sheet_path.display(),
+                    move_note
+                );
             }
         }
     }
@@ -1973,46 +2341,104 @@ impl ScreenlistApp {
             return;
         }
 
-        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-            let mut saved = 0usize;
+        let jpeg_quality = self.params.jpeg_quality;
+        let move_video = self.params.move_video_to_folder;
 
-            for (idx, video) in self.videos.iter().enumerate() {
+        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            let mut saved_sheets = 0usize;
+            let mut saved_screenshots = 0usize;
+            let mut moved_videos = 0usize;
+            let mut move_errors = 0usize;
+            let mut used_stems = HashSet::new();
+
+            for (idx, video) in self.videos.iter_mut().enumerate() {
                 if let Some(image) = &video.sheet_image {
-                    let base_stem = stem_name(&video.file_name);
-                    let mut output = folder.join(format!("{base_stem}_screenlist.jpg"));
-                    if output.exists() {
-                        output =
-                            folder.join(format!("{:02}_{base_stem}_screenlist.jpg", idx + 1));
+                    let raw_stem = stem_name(&video.file_name);
+                    let clean_stem = sanitize_folder_name(&raw_stem);
+                    let unique_stem = if used_stems.insert(clean_stem.to_lowercase()) {
+                        clean_stem
+                    } else {
+                        format!("{:02}_{}", idx + 1, clean_stem)
+                    };
+
+                    // Отдельная папка для каждого видео (например, folder/video1/)
+                    let video_folder = folder.join(&unique_stem);
+                    if fs::create_dir_all(&video_folder).is_err() {
+                        continue;
                     }
 
-                    if save_rgb_image(image, &output, self.params.jpeg_quality).is_ok() {
-                        saved += 1;
+                    let sheet_output = video_folder.join(format!("{unique_stem}_screenlist.jpg"));
+                    if save_rgb_image(image, &sheet_output, jpeg_quality).is_ok() {
+                        saved_sheets += 1;
+                    }
+
+                    for (shot_idx, shot) in video.screenshots.iter().enumerate() {
+                        let shot_output = video_folder.join(format!(
+                            "{}_ScreenShot{}.jpg",
+                            unique_stem,
+                            shot_idx + 1
+                        ));
+                        if save_rgb_image(&shot.rgb, &shot_output, jpeg_quality).is_ok() {
+                            saved_screenshots += 1;
+                        }
+                    }
+
+                    if move_video {
+                        let dst_video_path = video_folder.join(&video.file_name);
+                        match move_video_file(&video.path, &dst_video_path) {
+                            Ok(()) => {
+                                video.path = dst_video_path;
+                                moved_videos += 1;
+                            }
+                            Err(_) => {
+                                move_errors += 1;
+                            }
+                        }
                     }
                 }
             }
 
-            self.status_line =
-                format!("Сохранено {} скринлистов в {}", saved, folder.display());
+            let move_summary = if move_video {
+                if move_errors == 0 {
+                    format!(", перенесено видео: {moved_videos}")
+                } else {
+                    format!(", перенесено видео: {moved_videos} (ошибок переноса: {move_errors})")
+                }
+            } else {
+                String::new()
+            };
+
+            if saved_screenshots > 0 {
+                self.status_line = format!(
+                    "Сохранено {} скринлистов и {} скриншотов{} (по отдельным папкам) в {}",
+                    saved_sheets,
+                    saved_screenshots,
+                    move_summary,
+                    folder.display()
+                );
+            } else {
+                self.status_line = format!(
+                    "Сохранено {} скринлистов{} (по отдельным папкам) в {}",
+                    saved_sheets,
+                    move_summary,
+                    folder.display()
+                );
+            }
         }
     }
 
     fn save_all_to_zip(&mut self) {
-        let ready: Vec<(&str, &RgbImage)> = self
+        let ready_videos: Vec<&VideoItem> = self
             .videos
             .iter()
-            .filter_map(|video| {
-                video
-                    .sheet_image
-                    .as_ref()
-                    .map(|image| (video.file_name.as_str(), image))
-            })
+            .filter(|video| video.sheet_image.is_some())
             .collect();
 
-        if ready.is_empty() {
+        if ready_videos.is_empty() {
             return;
         }
 
-        let default_name = format!("screenlists_{}_videos.zip", ready.len());
+        let default_name = format!("screenlists_{}_videos.zip", ready_videos.len());
 
         if let Some(zip_path) = rfd::FileDialog::new()
             .set_file_name(&default_name)
@@ -2021,14 +2447,54 @@ impl ScreenlistApp {
         {
             let started = Instant::now();
 
-            match export_sheets_to_zip(&ready, &zip_path, self.params.jpeg_quality) {
+            let mut entries: Vec<(String, &RgbImage)> = Vec::new();
+            let mut used_stems = HashSet::new();
+            let mut total_shots = 0usize;
+
+            for (idx, video) in ready_videos.iter().enumerate() {
+                let raw_stem = stem_name(&video.file_name);
+                let clean_stem = sanitize_folder_name(&raw_stem);
+                let unique_stem = if used_stems.insert(clean_stem.to_lowercase()) {
+                    clean_stem
+                } else {
+                    format!("{:02}_{}", idx + 1, clean_stem)
+                };
+
+                // Внутри ZIP-архива у каждого видео своя отдельная папка (например, video1/)
+                if let Some(sheet) = video.sheet_image.as_ref() {
+                    entries.push((
+                        format!("{unique_stem}/{unique_stem}_screenlist.jpg"),
+                        sheet,
+                    ));
+                }
+
+                for (shot_idx, shot) in video.screenshots.iter().enumerate() {
+                    entries.push((
+                        format!("{unique_stem}/{unique_stem}_ScreenShot{}.jpg", shot_idx + 1),
+                        shot.rgb.as_ref(),
+                    ));
+                    total_shots += 1;
+                }
+            }
+
+            match export_images_to_zip(&entries, &zip_path, self.params.jpeg_quality) {
                 Ok(()) => {
-                    self.status_line = format!(
-                        "ZIP-архив ({} шт.) создан за {:.2} сек: {}",
-                        ready.len(),
-                        started.elapsed().as_secs_f64(),
-                        zip_path.display()
-                    );
+                    if total_shots > 0 {
+                        self.status_line = format!(
+                            "ZIP-архив ({} папок: скринлисты + {} скриншотов) создан за {:.2} сек: {}",
+                            ready_videos.len(),
+                            total_shots,
+                            started.elapsed().as_secs_f64(),
+                            zip_path.display()
+                        );
+                    } else {
+                        self.status_line = format!(
+                            "ZIP-архив ({} папок) создан за {:.2} сек: {}",
+                            ready_videos.len(),
+                            started.elapsed().as_secs_f64(),
+                            zip_path.display()
+                        );
+                    }
                 }
                 Err(error) => {
                     self.status_line = format!("Ошибка создания ZIP: {error}");
@@ -2088,6 +2554,14 @@ impl ScreenlistApp {
                     .clamp_range(1..=120)
                     .speed(1),
             );
+
+            ui.separator();
+            ui.label("Скриншотов:");
+            ui.add_enabled(
+                !self.is_processing,
+                egui::Slider::new(&mut self.params.screenshot_count, 0..=10),
+            )
+                .on_hover_text("Количество отдельных полноразмерных скриншотов (от 0 до 10)");
 
             ui.separator();
             ui.label("Колонок:");
@@ -2192,6 +2666,14 @@ impl ScreenlistApp {
                 .on_hover_text(
                     "Аппаратное декодирование через C libavutil hwcontext с откатом на CPU.",
                 );
+
+            ui.checkbox(
+                &mut self.params.move_video_to_folder,
+                "Переносить видео в папку",
+            )
+                .on_hover_text(
+                    "При сохранении переносить исходный видеофайл в его отдельную папку вместе со скринлистом и скриншотами.",
+                );
         });
 
         if layout_changed {
@@ -2235,7 +2717,7 @@ impl ScreenlistApp {
                 .add_enabled(
                     !self.is_processing && !self.videos.is_empty(),
                     egui::Button::new(
-                        egui::RichText::new("🚀 Создать ВСЕ скринлисты")
+                        egui::RichText::new("🚀 Создать для всех видео")
                             .strong()
                             .color(egui::Color32::WHITE),
                     )
@@ -2251,7 +2733,7 @@ impl ScreenlistApp {
                 if ui
                     .add_enabled(
                         !self.is_processing && active < self.videos.len(),
-                        egui::Button::new("🎬 Создать для выбранного"),
+                        egui::Button::new("🎬 Создать для выбранного видео"),
                     )
                     .clicked()
                 {
@@ -2272,7 +2754,7 @@ impl ScreenlistApp {
                 .count();
 
             if ui
-                .add_enabled(has_current_sheet, egui::Button::new("💾 Скачать текущий"))
+                .add_enabled(has_current_sheet, egui::Button::new("💾 Сохранить текущий"))
                 .clicked()
             {
                 self.save_current_sheet();
@@ -2291,7 +2773,7 @@ impl ScreenlistApp {
             if ui
                 .add_enabled(
                     ready_sheets > 0,
-                    egui::Button::new(format!("📦 Скачать ZIP ({ready_sheets})")),
+                    egui::Button::new(format!("📦 Создать ZIP ({ready_sheets})")),
                 )
                 .clicked()
             {
@@ -2410,9 +2892,9 @@ impl eframe::App for ScreenlistApp {
                 self.show_video_queue(ui);
             });
 
-        // Правая секция «Скринлист» — оставшиеся 75% ширины окна
+        // Правая секция («Скринлист» / «Скриншоты») — оставшиеся 75% ширины окна
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some((video_idx, frame_idx)) = self.show_active_sheet(ui) {
+            if let Some((video_idx, frame_idx)) = self.show_preview_panel(ui) {
                 self.shift_single_frame(video_idx, frame_idx);
             }
         });
@@ -2814,6 +3296,37 @@ fn draw_text_rgb(
 // ЭКСПОРТ И УТИЛИТЫ
 // ============================================================================
 
+fn is_same_file_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+fn move_video_file(src: &Path, dst: &Path) -> Result<(), String> {
+    if is_same_file_path(src, dst) {
+        return Ok(());
+    }
+
+    if !src.exists() {
+        return Err(format!("Исходный файл не найден: {}", src.display()));
+    }
+
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+
+    fs::copy(src, dst).map_err(|error| format!("Не удалось скопировать видео: {error}"))?;
+    fs::remove_file(src).map_err(|error| {
+        format!("Видео скопировано, но не удалось удалить исходный файл: {error}")
+    })?;
+
+    Ok(())
+}
+
 fn rgb_to_texture(ctx: &egui::Context, name: &str, image: &RgbImage) -> egui::TextureHandle {
     let size = [image.width() as usize, image.height() as usize];
     let color_image = egui::ColorImage::from_rgb(size, image.as_raw());
@@ -2845,29 +3358,25 @@ fn save_rgb_image(image: &RgbImage, path: &Path, jpeg_quality: u8) -> Result<(),
     }
 }
 
-fn export_sheets_to_zip(
-    sheets: &[(&str, &RgbImage)],
+fn export_images_to_zip(
+    entries: &[(String, &RgbImage)],
     zip_path: &Path,
     jpeg_quality: u8,
 ) -> Result<(), String> {
     let file = File::create(zip_path).map_err(|error| error.to_string())?;
     let mut zip = zip::ZipWriter::new(file);
 
-    for (batch_index, batch) in sheets.chunks(ZIP_ENCODE_BATCH_SIZE).enumerate() {
+    for batch in entries.chunks(ZIP_ENCODE_BATCH_SIZE) {
         let encoded: Vec<Result<Vec<u8>, String>> = batch
             .par_iter()
             .map(|(_, image)| encode_jpeg(image, jpeg_quality))
             .collect();
 
-        for (offset, ((video_name, _), jpeg_buffer)) in batch.iter().zip(encoded).enumerate() {
-            let index = batch_index * ZIP_ENCODE_BATCH_SIZE + offset;
-            let entry_name =
-                format!("{:02}_{}_screenlist.jpg", index + 1, stem_name(video_name));
-
+        for ((entry_name, _), jpeg_buffer) in batch.iter().zip(encoded) {
             let options = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
 
-            zip.start_file(entry_name, options)
+            zip.start_file(entry_name.as_str(), options)
                 .map_err(|error| error.to_string())?;
             zip.write_all(&jpeg_buffer?)
                 .map_err(|error| error.to_string())?;
@@ -2922,6 +3431,23 @@ fn stem_name(name: &str) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or("video")
         .to_owned()
+}
+
+fn sanitize_folder_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        "video".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 fn format_duration(seconds: f64) -> String {
