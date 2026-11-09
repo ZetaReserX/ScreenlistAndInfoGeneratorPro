@@ -43,8 +43,7 @@ No installation or external FFmpeg setup is required:
 
 ---
 
-## 🛠️ Building from Source (Windows x64)
-
+## Building from Source (Windows x64)
 ### Prerequisites
 1. **Rust Toolchain** (stable, `x86_64-pc-windows-msvc`)
 2. **Visual Studio C++ Build Tools** (MSVC compiler for compiling the C bridge via the `cc` crate)
