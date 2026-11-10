@@ -1,10 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use anyhow::{bail, Context, Result as AnyResult};
 use eframe::egui;
+use futures_util::stream::{self, StreamExt};
 use image::{codecs::jpeg::JpegEncoder, Rgb, RgbImage};
 use rayon::prelude::*;
-use std::collections::HashSet;
+use reqwest::{multipart, Client};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -13,11 +17,18 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
     Arc,
 };
+use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use walkdir::WalkDir;
 
 const MAX_WORKERS: usize = 32;
 const MAX_FRAMES_PER_DECODER_TASK: usize = 3;
 const ZIP_ENCODE_BATCH_SIZE: usize = 4;
+
+const UPLOAD_URL: &str = "https://new.fastpic.org/upload";
+const ANONYMOUS_UPLOAD_URL: &str = "https://fastpic.org/upload?api=1";
+const MAX_CONCURRENT_UPLOADS: usize = 4;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "webm", "flv", "ts", "m2ts", "mts", "m4v", "wmv", "mpg", "mpeg",
@@ -52,7 +63,7 @@ fn setup_custom_style(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     Ru,
     En,
@@ -64,6 +75,90 @@ impl Language {
         match self {
             Self::Ru => ru,
             Self::En => en,
+        }
+    }
+
+    fn text(self, key: &str) -> &'static str {
+        match (self, key) {
+            (Self::Ru, "subtitle") => "Скринлисты и скриншоты",
+            (Self::En, "subtitle") => "Screenlists and screenshots",
+            (Self::Ru, "add_images") => "Добавить изображения",
+            (Self::En, "add_images") => "Add images",
+            (Self::Ru, "add_folder") => "Добавить папку с изображениями",
+            (Self::En, "add_folder") => "Add image folder",
+            (Self::Ru, "clear") => "Очистить список",
+            (Self::En, "clear") => "Clear list",
+            (Self::Ru, "upload") => "Загрузить на FastPic",
+            (Self::En, "upload") => "Upload to FastPic",
+            (Self::Ru, "settings") => "Настройки FastPic",
+            (Self::En, "settings") => "FastPic settings",
+            (Self::Ru, "api_key") => "API-ключ",
+            (Self::En, "api_key") => "API key",
+            (Self::Ru, "own_key") => "Свой ключ",
+            (Self::En, "own_key") => "Own key",
+            (Self::Ru, "anonymous") => "Анонимная загрузка",
+            (Self::En, "anonymous") => "Anonymous upload",
+            (Self::Ru, "show") => "Показать",
+            (Self::En, "show") => "Show",
+            (Self::Ru, "hide") => "Скрыть",
+            (Self::En, "hide") => "Hide",
+            (Self::Ru, "thumbnail") => "Миниатюра",
+            (Self::En, "thumbnail") => "Thumbnail",
+            (Self::Ru, "make_thumbnail") => "Делать миниатюру",
+            (Self::En, "make_thumbnail") => "Create thumbnail",
+            (Self::Ru, "thumbnail_size") => "Большая сторона миниатюры, px",
+            (Self::En, "thumbnail_size") => "Thumbnail longest side, px",
+            (Self::Ru, "example_150") => "Например 150",
+            (Self::En, "example_150") => "For example 150",
+            (Self::Ru, "thumbnail_text") => "Текст миниатюры",
+            (Self::En, "thumbnail_text") => "Thumbnail text",
+            (Self::Ru, "no_text") => "Без текста",
+            (Self::En, "no_text") => "No text",
+            (Self::Ru, "size_mode") => "Разрешение и размер",
+            (Self::En, "size_mode") => "Resolution and size",
+            (Self::Ru, "custom_text") => "Кастомный текст",
+            (Self::En, "custom_text") => "Custom text",
+            (Self::Ru, "filename") => "Название файла",
+            (Self::En, "filename") => "File name",
+            (Self::Ru, "custom_thumbnail_text") => "Кастомный текст миниатюры",
+            (Self::En, "custom_thumbnail_text") => "Custom thumbnail text",
+            (Self::Ru, "delete_after") => "Удалить через, минут",
+            (Self::En, "delete_after") => "Delete after, minutes",
+            (Self::Ru, "no_delete") => "По умолчанию не удалять",
+            (Self::En, "no_delete") => "Do not delete by default",
+            (Self::Ru, "files") => "Файлы",
+            (Self::En, "files") => "Files",
+            (Self::Ru, "drop_files") => {
+                "Перетащите сюда файлы или папки либо нажмите «Добавить изображения»."
+            }
+            (Self::En, "drop_files") => "Drop files or folders here, or click “Add images”.",
+            (Self::Ru, "results") => "Результаты",
+            (Self::En, "results") => "Results",
+            (Self::Ru, "results_empty") => "После загрузки здесь появятся ссылки FastPic.",
+            (Self::En, "results_empty") => "FastPic links will appear here after uploading.",
+            (Self::Ru, "open_page") => "Открыть страницу",
+            (Self::En, "open_page") => "Open page",
+            (Self::Ru, "copy") => "Копировать",
+            (Self::En, "copy") => "Copy",
+            (Self::Ru, "copy_all") => "Копировать все BBCode",
+            (Self::En, "copy_all") => "Copy all BBCode",
+            (Self::Ru, "copy_video") => "Копировать BBCode видео",
+            (Self::En, "copy_video") => "Copy video BBCode",
+            (Self::Ru, "expand_all") => "Развернуть все подразделы",
+            (Self::En, "expand_all") => "Expand all subsections",
+            (Self::Ru, "collapse_all") => "Свернуть все подразделы",
+            (Self::En, "collapse_all") => "Collapse all subsections",
+            (Self::Ru, "screenlist") => "скринлист",
+            (Self::En, "screenlist") => "screenlist",
+            (Self::Ru, "screenshot") => "скриншот",
+            (Self::En, "screenshot") => "screenshot",
+            (Self::Ru, "image") => "изображение",
+            (Self::En, "image") => "image",
+            (Self::Ru, "russian") => "Русский",
+            (Self::En, "russian") => "Russian",
+            (Self::Ru, "english") => "Английский",
+            (Self::En, "english") => "English",
+            _ => "",
         }
     }
 }
@@ -144,12 +239,16 @@ struct RenderParams {
     grid_width: u32,
     workers: usize,
     core_mode: CoreMode,
-    show_timestamps: bool,
+    show_timestamps: true_or_bool::BoolType,
     turbo_keyframe: bool,
     hwaccel: bool,
     move_video_to_folder: bool,
     jpeg_quality: u8,
     lang: Language,
+}
+
+mod true_or_bool {
+    pub type BoolType = bool;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1018,6 +1117,1115 @@ mod libav {
     }
 }
 
+// ============================================================================
+// ПОДПРОГРАММА FASTPIC UPLOADER
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct UploadResponse {
+    big_link: Option<String>,
+    thumb_link: Option<String>,
+    view_link: Option<String>,
+    short_link: Option<String>,
+    delete_link: Option<String>,
+    width: Option<u64>,
+    height: Option<u64>,
+    size: Option<u64>,
+    hotlinked: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnonymousUploadResponse {
+    status: Option<String>,
+    error: Option<String>,
+    imagepath: Option<String>,
+    viewurl: Option<String>,
+    viewfullurl: Option<String>,
+    thumbpath: Option<String>,
+}
+
+impl UploadResponse {
+    fn bbcode(&self) -> String {
+        match (&self.view_link, &self.thumb_link) {
+            (Some(view), Some(thumb)) => format!("[URL={view}][IMG]{thumb}[/IMG][/URL]"),
+            _ => String::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UploadResult {
+    path: PathBuf,
+    response: AnyResult<UploadResponse>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageKind {
+    Screenlist,
+    Screenshot,
+    Other,
+}
+
+impl ImageKind {
+    fn label(self, language: Language) -> &'static str {
+        match self {
+            Self::Screenlist => language.text("screenlist"),
+            Self::Screenshot => language.text("screenshot"),
+            Self::Other => language.text("image"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AddProgress {
+    path: PathBuf,
+    processed: usize,
+    is_image: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UploadOptions {
+    key: Option<String>,
+    language: Language,
+    thumb_size: Option<String>,
+    check_thumb: Option<String>,
+    thumb_text: Option<String>,
+    delete_after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    Anonymous,
+    Own,
+}
+
+struct FastPicSubApp {
+    language: Language,
+    auth_mode: AuthMode,
+    own_key: String,
+    key_visible: bool,
+    make_thumbnail: bool,
+    thumb_size: String,
+    check_thumb: usize,
+    thumb_text: String,
+    delete_after: String,
+    files: Vec<PathBuf>,
+    results: Vec<UploadResult>,
+    sections_expanded: bool,
+    expanded_sections: BTreeMap<String, bool>,
+    status: String,
+    uploading: bool,
+    total_to_upload: usize,
+    receiver: Option<mpsc::Receiver<UploadResult>>,
+    adding: bool,
+    add_processed: usize,
+    add_total: usize,
+    add_added: usize,
+    add_rejected: usize,
+    add_receiver: Option<mpsc::Receiver<AddProgress>>,
+}
+
+impl FastPicSubApp {
+    fn new(language: Language) -> Self {
+        Self {
+            language,
+            auth_mode: AuthMode::Anonymous,
+            own_key: String::new(),
+            key_visible: false,
+            make_thumbnail: true,
+            thumb_size: String::new(),
+            check_thumb: 1,
+            thumb_text: String::new(),
+            delete_after: String::new(),
+            files: Vec::new(),
+            results: Vec::new(),
+            sections_expanded: false,
+            expanded_sections: BTreeMap::new(),
+            status: language.text("drop_files").to_owned(),
+            uploading: false,
+            total_to_upload: 0,
+            receiver: None,
+            adding: false,
+            add_processed: 0,
+            add_total: 0,
+            add_added: 0,
+            add_rejected: 0,
+            add_receiver: None,
+        }
+    }
+
+    #[inline]
+    fn is_busy(&self) -> bool {
+        self.uploading || self.adding
+    }
+
+    fn sync_language(&mut self, lang: Language) {
+        if self.language != lang {
+            self.language = lang;
+            if self.files.is_empty() && !self.uploading && !self.adding && self.results.is_empty() {
+                self.status = self.language.text("drop_files").to_owned();
+            }
+        }
+    }
+
+    fn add_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        if self.adding || self.uploading {
+            return;
+        }
+        let mut candidates = Vec::new();
+        for path in paths {
+            let collected = if path.is_dir() {
+                collect_directory(&path).unwrap_or_default()
+            } else if path.is_file() {
+                vec![path]
+            } else {
+                Vec::new()
+            };
+            candidates.extend(collected);
+        }
+        candidates.sort();
+        candidates.dedup();
+        if candidates.is_empty() {
+            self.status = if self.language == Language::Ru {
+                "Изображения не найдены"
+            } else {
+                "No images found"
+            }
+                .to_owned();
+            return;
+        }
+
+        let total = candidates.len();
+        let (sender, receiver) = mpsc::channel();
+        self.add_receiver = Some(receiver);
+        self.adding = true;
+        self.add_processed = 0;
+        self.add_total = total;
+        self.add_added = 0;
+        self.add_rejected = 0;
+        self.status = if self.language == Language::Ru {
+            format!("Проверка изображений: 0/{total}")
+        } else {
+            format!("Checking images: 0/{total}")
+        };
+
+        thread::spawn(move || {
+            for (index, path) in candidates.into_iter().enumerate() {
+                let _ = sender.send(AddProgress {
+                    is_image: is_image_file(&path),
+                    path,
+                    processed: index + 1,
+                });
+            }
+        });
+    }
+
+    fn poll_additions(&mut self) {
+        let events = self
+            .add_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for event in events {
+            self.add_processed = event.processed;
+            if event.is_image {
+                if !self.files.contains(&event.path) {
+                    self.files.push(event.path);
+                    self.add_added += 1;
+                }
+            } else {
+                self.add_rejected += 1;
+            }
+        }
+
+        if self.adding && self.add_processed >= self.add_total {
+            self.files.sort();
+            self.adding = false;
+            self.add_receiver = None;
+            self.status = if self.language == Language::Ru {
+                format!(
+                    "Добавлено изображений: {}, отклонено не изображений: {}",
+                    self.add_added, self.add_rejected
+                )
+            } else {
+                format!(
+                    "Images added: {}, non-images rejected: {}",
+                    self.add_added, self.add_rejected
+                )
+            };
+        }
+    }
+
+    fn start_upload(&mut self) {
+        if self.uploading {
+            return;
+        }
+        let key = match self.auth_mode {
+            AuthMode::Anonymous => None,
+            AuthMode::Own => Some(self.own_key.trim()),
+        };
+        if self.auth_mode == AuthMode::Own && key.map_or(true, str::is_empty) {
+            self.status = if self.language == Language::Ru {
+                "Укажите свой API-ключ FastPic"
+            } else {
+                "Enter your FastPic API key"
+            }
+                .to_owned();
+            return;
+        }
+        if self.files.is_empty() {
+            self.status = if self.language == Language::Ru {
+                "Добавьте хотя бы один файл"
+            } else {
+                "Add at least one file"
+            }
+                .to_owned();
+            return;
+        }
+
+        let delete_after = match parse_optional_u64(&self.delete_after, self.language) {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        let thumb_size = self
+            .make_thumbnail
+            .then(|| optional_string(&self.thumb_size))
+            .flatten();
+        let check_thumb = if !self.make_thumbnail {
+            Some("no".to_owned())
+        } else {
+            match self.check_thumb {
+                1 => Some("size".to_owned()),
+                2 => Some("text".to_owned()),
+                3 => Some("filename".to_owned()),
+                _ => None,
+            }
+        };
+        let options = UploadOptions {
+            key: key.map(str::to_owned),
+            language: self.language,
+            thumb_size,
+            check_thumb,
+            thumb_text: self
+                .make_thumbnail
+                .then(|| optional_string(&self.thumb_text))
+                .flatten(),
+            delete_after,
+        };
+        let files = std::mem::take(&mut self.files);
+        let total = files.len();
+        let (sender, receiver) = mpsc::channel();
+        self.receiver = Some(receiver);
+        self.results.clear();
+        self.total_to_upload = total;
+        self.uploading = true;
+        self.status = if self.language == Language::Ru {
+            format!("Загрузка началась: 0/{total}")
+        } else {
+            format!("Upload started: 0/{total}")
+        };
+
+        let language = self.language;
+        thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    for path in files {
+                        let _ = sender.send(UploadResult {
+                            path,
+                            response: Err(anyhow::anyhow!(
+                                "{}",
+                                localized_error(
+                                    language,
+                                    "Не удалось запустить загрузчик",
+                                    "Failed to start uploader",
+                                    &error
+                                )
+                            )),
+                        });
+                    }
+                    return;
+                }
+            };
+            runtime.block_on(upload_all(files, options, sender));
+        });
+    }
+
+    fn poll_uploads(&mut self) {
+        let Some(receiver) = &self.receiver else {
+            return;
+        };
+        let mut received = 0;
+        while let Ok(result) = receiver.try_recv() {
+            self.results.push(result);
+            received += 1;
+        }
+        if received > 0 {
+            let completed = self.results.len();
+            self.status = if self.language == Language::Ru {
+                format!("Загружено: {completed}/{}", self.total_to_upload)
+            } else {
+                format!("Uploaded: {completed}/{}", self.total_to_upload)
+            };
+            if completed == self.total_to_upload {
+                self.uploading = false;
+                self.receiver = None;
+                self.status = if self.language == Language::Ru {
+                    "Загрузка завершена"
+                } else {
+                    "Upload completed"
+                }
+                    .to_owned();
+            }
+        }
+    }
+
+    fn draw_top_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("FastPic Uploader");
+            ui.separator();
+            ui.label(self.language.text("subtitle"));
+            ui.separator();
+            egui::ComboBox::from_id_source("fastpic_language")
+                .selected_text(if self.language == Language::Ru {
+                    self.language.text("russian")
+                } else {
+                    self.language.text("english")
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.language,
+                        Language::Ru,
+                        Language::Ru.text("russian"),
+                    );
+                    ui.selectable_value(
+                        &mut self.language,
+                        Language::En,
+                        Language::En.text("english"),
+                    );
+                });
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.uploading && !self.adding,
+                    egui::Button::new(self.language.text("add_images")),
+                )
+                .clicked()
+            {
+                if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                    self.add_paths(paths);
+                }
+            }
+            if ui
+                .add_enabled(
+                    !self.uploading && !self.adding,
+                    egui::Button::new(self.language.text("add_folder")),
+                )
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.add_paths([path]);
+                }
+            }
+            if ui.button(self.language.text("clear")).clicked() && !self.uploading && !self.adding {
+                self.files.clear();
+                self.results.clear();
+                self.status = if self.language == Language::Ru {
+                    "Список очищен"
+                } else {
+                    "List cleared"
+                }
+                    .to_owned();
+            }
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(
+                    !self.uploading,
+                    egui::Button::new(
+                        egui::RichText::new(self.language.text("upload"))
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                        .fill(egui::Color32::from_rgb(75, 95, 210)),
+                )
+                .clicked()
+            {
+                self.start_upload();
+            }
+        });
+        if self.adding {
+            let progress = if self.add_total == 0 {
+                0.0
+            } else {
+                self.add_processed as f32 / self.add_total as f32
+            };
+            ui.add(egui::ProgressBar::new(progress).text(format!(
+                "{}: {}/{}",
+                if self.language == Language::Ru {
+                    "Проверка изображений"
+                } else {
+                    "Checking images"
+                },
+                self.add_processed,
+                self.add_total
+            )));
+        } else if self.uploading {
+            let progress = if self.total_to_upload == 0 {
+                0.0
+            } else {
+                self.results.len() as f32 / self.total_to_upload as f32
+            };
+            ui.add(egui::ProgressBar::new(progress).text(format!(
+                "{}: {}/{}",
+                if self.language == Language::Ru {
+                    "Загрузка на FastPic"
+                } else {
+                    "Uploading to FastPic"
+                },
+                self.results.len(),
+                self.total_to_upload
+            )));
+        }
+        if self.files.is_empty() && !self.uploading && !self.adding && self.results.is_empty() {
+            self.status = self.language.text("drop_files").to_owned();
+        }
+        ui.label(&self.status);
+    }
+
+    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(self.language.text("settings"))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Grid::new("fastpic_settings_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(self.language.text("api_key"));
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.auth_mode,
+                                AuthMode::Anonymous,
+                                self.language.text("anonymous"),
+                            );
+                            ui.selectable_value(
+                                &mut self.auth_mode,
+                                AuthMode::Own,
+                                self.language.text("own_key"),
+                            );
+                        });
+                        ui.end_row();
+
+                        if self.auth_mode == AuthMode::Own {
+                            ui.label(self.language.text("own_key"));
+                            ui.horizontal(|ui| {
+                                let mut edit = egui::TextEdit::singleline(&mut self.own_key)
+                                    .desired_width(360.0);
+                                if !self.key_visible {
+                                    edit = edit.password(true);
+                                }
+                                ui.add(edit);
+                                if ui
+                                    .button(if self.key_visible {
+                                        self.language.text("hide")
+                                    } else {
+                                        self.language.text("show")
+                                    })
+                                    .clicked()
+                                {
+                                    self.key_visible = !self.key_visible;
+                                }
+                            });
+                            ui.end_row();
+                        }
+                        ui.label(self.language.text("thumbnail"));
+                        ui.checkbox(
+                            &mut self.make_thumbnail,
+                            self.language.text("make_thumbnail"),
+                        );
+                        ui.end_row();
+                        ui.label(self.language.text("thumbnail_size"));
+                        ui.add_enabled(
+                            self.make_thumbnail,
+                            egui::TextEdit::singleline(&mut self.thumb_size)
+                                .hint_text(self.language.text("example_150")),
+                        );
+                        ui.end_row();
+                        ui.label(self.language.text("thumbnail_text"));
+                        ui.add_enabled_ui(self.make_thumbnail, |ui| {
+                            egui::ComboBox::from_id_source("fastpic_check_thumb")
+                                .selected_text(check_thumb_name(self.language, self.check_thumb))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.check_thumb,
+                                        0,
+                                        self.language.text("no_text"),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.check_thumb,
+                                        1,
+                                        self.language.text("size_mode"),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.check_thumb,
+                                        2,
+                                        self.language.text("custom_text"),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.check_thumb,
+                                        3,
+                                        self.language.text("filename"),
+                                    );
+                                });
+                        });
+                        ui.end_row();
+                        ui.label(self.language.text("custom_thumbnail_text"));
+                        ui.add_enabled(
+                            self.make_thumbnail && self.check_thumb == 2,
+                            egui::TextEdit::singleline(&mut self.thumb_text),
+                        );
+                        ui.end_row();
+                        ui.label(self.language.text("delete_after"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.delete_after)
+                                .hint_text(self.language.text("no_delete")),
+                        );
+                        ui.end_row();
+                    });
+            });
+    }
+
+    fn draw_files(&mut self, ui: &mut egui::Ui) {
+        ui.heading(format!(
+            "{} ({})",
+            self.language.text("files"),
+            self.files.len()
+        ));
+        if self.files.is_empty() {
+            ui.add_space(8.0);
+            ui.label(self.language.text("drop_files"));
+        } else {
+            egui::ScrollArea::vertical()
+                .id_source("fastpic_files_scroll")
+                .max_height(190.0)
+                .show(ui, |ui| {
+                    let mut remove = None;
+                    for (index, path) in self.files.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(path.display().to_string());
+                            if !self.uploading && ui.small_button("×").clicked() {
+                                remove = Some(index);
+                            }
+                        });
+                    }
+                    if let Some(index) = remove {
+                        self.files.remove(index);
+                    }
+                });
+        }
+    }
+
+    fn draw_results(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.heading(self.language.text("results"));
+        if self.results.is_empty() {
+            ui.label(self.language.text("results_empty"));
+            return;
+        }
+        let all_bbcode = self
+            .results
+            .iter()
+            .filter_map(|result| result.response.as_ref().ok())
+            .map(UploadResponse::bbcode)
+            .filter(|bbcode| !bbcode.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.add_enabled_ui(!all_bbcode.is_empty(), |ui| {
+            if ui.button(self.language.text("copy_all")).clicked() {
+                copy_text_to_clipboard(ui.ctx(), &all_bbcode);
+            }
+        });
+        let mut groups: BTreeMap<String, Vec<&UploadResult>> = BTreeMap::new();
+        for result in &self.results {
+            let (video_name, _) = classify_image_path(&result.path);
+            groups.entry(video_name).or_default().push(result);
+        }
+        let all_expanded = !groups.is_empty()
+            && groups
+            .keys()
+            .all(|name| self.expanded_sections.get(name).copied().unwrap_or(false));
+        if ui
+            .button(if all_expanded {
+                self.language.text("collapse_all")
+            } else {
+                self.language.text("expand_all")
+            })
+            .clicked()
+        {
+            self.sections_expanded = !all_expanded;
+            for name in groups.keys() {
+                self.expanded_sections
+                    .insert(name.clone(), self.sections_expanded);
+            }
+        }
+        egui::ScrollArea::vertical()
+            .id_source("fastpic_results_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (video_name, results) in groups {
+                    let expanded = self
+                        .expanded_sections
+                        .get(&video_name)
+                        .copied()
+                        .unwrap_or(false);
+                    let response = egui::CollapsingHeader::new(video_name.clone())
+                        .open(Some(expanded))
+                        .show(ui, |ui| {
+                            let video_bbcode = results
+                                .iter()
+                                .filter_map(|result| result.response.as_ref().ok())
+                                .map(UploadResponse::bbcode)
+                                .filter(|bbcode| !bbcode.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            ui.add_enabled_ui(!video_bbcode.is_empty(), |ui| {
+                                if ui.button(self.language.text("copy_video")).clicked() {
+                                    copy_text_to_clipboard(ui.ctx(), &video_bbcode);
+                                }
+                            });
+                            for result in results {
+                                let (_, image_kind) = classify_image_path(&result.path);
+                                ui.group(|ui| match &result.response {
+                                    Ok(response) => {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{} - {}",
+                                                result.path.display(),
+                                                image_kind.label(self.language)
+                                            ))
+                                                .strong(),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label("BBCode:");
+                                            let mut bbcode = response.bbcode();
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut bbcode)
+                                                    .desired_width(ui.available_width()),
+                                            );
+                                        });
+                                        ui.horizontal(|ui| {
+                                            if let Some(view_link) = &response.view_link {
+                                                if ui
+                                                    .button(self.language.text("open_page"))
+                                                    .clicked()
+                                                {
+                                                    ui.ctx()
+                                                        .open_url(egui::OpenUrl::new_tab(view_link));
+                                                }
+                                            }
+                                            if ui.button(self.language.text("copy")).clicked() {
+                                                copy_text_to_clipboard(
+                                                    ui.ctx(),
+                                                    &response.bbcode(),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    Err(error) => {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(240, 100, 100),
+                                            format!(
+                                                "{} - {}: {error:#}",
+                                                result.path.display(),
+                                                image_kind.label(self.language)
+                                            ),
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                    if response.header_response.clicked() {
+                        self.expanded_sections.insert(video_name, !expanded);
+                    }
+                }
+            });
+    }
+}
+
+fn check_thumb_name(language: Language, value: usize) -> &'static str {
+    match value {
+        1 => language.text("size_mode"),
+        2 => language.text("custom_text"),
+        3 => language.text("filename"),
+        _ => language.text("no_text"),
+    }
+}
+
+fn classify_image_path(path: &Path) -> (String, ImageKind) {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Other");
+    let Some(separator) = stem.rfind('_') else {
+        return (stem.to_owned(), ImageKind::Other);
+    };
+
+    let video_name = &stem[..separator];
+    let suffix = stem[separator + 1..].to_ascii_lowercase();
+    if suffix == "screenlist" {
+        return (video_name.to_owned(), ImageKind::Screenlist);
+    }
+    if suffix == "screenshot"
+        || (suffix.starts_with("screenshot")
+        && suffix["screenshot".len()..]
+        .chars()
+        .all(|character| character.is_ascii_digit()))
+    {
+        return (video_name.to_owned(), ImageKind::Screenshot);
+    }
+    (stem.to_owned(), ImageKind::Other)
+}
+
+fn optional_string(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_owned())
+}
+
+fn parse_optional_u64(value: &str, language: Language) -> Result<Option<u64>, String> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    value.trim().parse().map(Some).map_err(|_| {
+        if language == Language::Ru {
+            "Удаление через должно быть целым числом минут"
+        } else {
+            "Delete-after value must be a whole number of minutes"
+        }
+            .to_owned()
+    })
+}
+
+fn localized_error(
+    language: Language,
+    russian: &str,
+    english: &str,
+    error: impl std::fmt::Display,
+) -> String {
+    let prefix = if language == Language::Ru {
+        russian
+    } else {
+        english
+    };
+    let error = error.to_string();
+    if error.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}: {error}")
+    }
+}
+
+fn collect_directory(path: &Path) -> AnyResult<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in WalkDir::new(path).follow_links(false) {
+        let entry = entry.with_context(|| format!("Не удалось обойти {}", path.display()))?;
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn is_image_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("jpg")
+            | Some("jpeg")
+            | Some("png")
+            | Some("gif")
+            | Some("webp")
+            | Some("bmp")
+            | Some("tif")
+            | Some("tiff")
+            | Some("avif")
+            | Some("ico")
+    )
+}
+
+async fn upload_all(
+    files: Vec<PathBuf>,
+    options: UploadOptions,
+    sender: mpsc::Sender<UploadResult>,
+) {
+    let client = match Client::builder().user_agent("fastpic-uploader/0.1").build() {
+        Ok(client) => client,
+        Err(error) => {
+            for path in files {
+                let _ = sender.send(UploadResult {
+                    path,
+                    response: Err(anyhow::anyhow!(localized_error(
+                        options.language,
+                        "Не удалось создать HTTP-клиент",
+                        "Failed to create HTTP client",
+                        &error
+                    ))),
+                });
+            }
+            return;
+        }
+    };
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
+    let options = Arc::new(options);
+
+    stream::iter(files.into_iter().map(|path| {
+        let client = client.clone();
+        let options = Arc::clone(&options);
+        let semaphore = Arc::clone(&semaphore);
+        async move {
+            let response = match semaphore.acquire_owned().await {
+                Ok(_permit) => upload_file(&client, &options, &path).await,
+                Err(error) => Err(anyhow::anyhow!(localized_error(
+                    options.language,
+                    "Ошибка планировщика загрузок",
+                    "Upload scheduler error",
+                    &error
+                ))),
+            };
+            (path, response)
+        }
+    }))
+        .buffer_unordered(MAX_CONCURRENT_UPLOADS)
+        .for_each(|(path, response)| {
+            let sender = sender.clone();
+            async move {
+                let _ = sender.send(UploadResult { path, response });
+            }
+        })
+        .await;
+}
+
+async fn upload_file(
+    client: &Client,
+    options: &UploadOptions,
+    path: &Path,
+) -> AnyResult<UploadResponse> {
+    let bytes = tokio::fs::read(path).await.with_context(|| {
+        localized_error(
+            options.language,
+            &format!("Не удалось прочитать {}", path.display()),
+            &format!("Failed to read {}", path.display()),
+            "",
+        )
+    })?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload");
+    let part = multipart::Part::bytes(bytes).file_name(filename.to_owned());
+    let mut form = multipart::Form::new().part("file1", part);
+
+    let request = if options.key.is_none() {
+        let check_thumb = options.check_thumb.as_deref().unwrap_or("no");
+        let thumb_size = options.thumb_size.as_deref().unwrap_or("");
+        form = form
+            .text("method", "file")
+            .text("check_thumb", check_thumb.to_owned())
+            .text("uploading", "1")
+            .text("orig_rotate", "0")
+            .text("thumb_size", thumb_size.to_owned());
+        client
+            .post(format!("{ANONYMOUS_UPLOAD_URL}&method=file"))
+            .header(reqwest::header::USER_AGENT, "Mozilla/5.0")
+            .multipart(form)
+    } else {
+        if let Some(value) = &options.thumb_size {
+            form = form.text("thumb_size", value.clone());
+        }
+        if let Some(value) = &options.check_thumb {
+            form = form.text("check_thumb", value.clone());
+        }
+        if let Some(value) = &options.thumb_text {
+            form = form.text("thumb_text", value.clone());
+        }
+        if let Some(value) = options.delete_after {
+            form = form.text("delete_after", value.to_string());
+        }
+        client.post(UPLOAD_URL).multipart(form)
+    };
+    let request = if let Some(key) = &options.key {
+        request.bearer_auth(key)
+    } else {
+        request
+    };
+    let response = request.send().await.with_context(|| {
+        localized_error(
+            options.language,
+            &format!("Ошибка запроса для {}", path.display()),
+            &format!("Request failed for {}", path.display()),
+            "",
+        )
+    })?;
+    let status = response.status();
+    let body = response.text().await.with_context(|| {
+        localized_error(
+            options.language,
+            &format!("Не удалось прочитать ответ для {}", path.display()),
+            &format!("Failed to read response for {}", path.display()),
+            "",
+        )
+    })?;
+    if !status.is_success() {
+        bail!(
+            "{}",
+            localized_error(
+                options.language,
+                &format!(
+                    "FastPic вернул HTTP {} для {}: {}",
+                    status,
+                    path.display(),
+                    body
+                ),
+                &format!(
+                    "FastPic returned HTTP {} for {}: {}",
+                    status,
+                    path.display(),
+                    body
+                ),
+                "",
+            )
+        );
+    }
+    if options.key.is_none() {
+        let anonymous_response: AnonymousUploadResponse = match quick_xml::de::from_str(&body) {
+            Ok(response) => response,
+            Err(_error) => {
+                let summary = summarize_server_response(&body);
+                bail!(
+                    "{}",
+                    localized_error(
+                        options.language,
+                        &format!(
+                            "FastPic вернул неподдерживаемый ответ для {}: {}",
+                            path.display(),
+                            summary
+                        ),
+                        &format!(
+                            "FastPic returned an unsupported response for {}: {}",
+                            path.display(),
+                            summary
+                        ),
+                        "",
+                    )
+                );
+            }
+        };
+        if anonymous_response.status.as_deref() != Some("ok") {
+            let error = anonymous_response
+                .error
+                .as_deref()
+                .unwrap_or("Unknown FastPic error");
+            bail!("{error}");
+        }
+        let view_link = anonymous_response
+            .viewfullurl
+            .or(anonymous_response.viewurl)
+            .map(|url| url.replace("fastpic.org/view/", "fastpic.org/fullview/"));
+        return Ok(UploadResponse {
+            big_link: anonymous_response.imagepath.clone(),
+            thumb_link: anonymous_response.thumbpath,
+            view_link,
+            short_link: None,
+            delete_link: None,
+            width: None,
+            height: None,
+            size: None,
+            hotlinked: None,
+        });
+    }
+
+    serde_json::from_str(&body).with_context(|| {
+        localized_error(
+            options.language,
+            &format!("FastPic вернул некорректный JSON для {}", path.display()),
+            &format!("FastPic returned invalid JSON for {}", path.display()),
+            "",
+        )
+    })
+}
+
+fn summarize_server_response(body: &str) -> String {
+    let lower = body.to_ascii_lowercase();
+    let fragment = if lower.contains("<title") {
+        extract_tag_content(body, "title")
+    } else if lower.contains("<h1") {
+        extract_tag_content(body, "h1")
+    } else if lower.contains("<body") {
+        extract_tag_content(body, "body")
+    } else {
+        body.to_owned()
+    };
+    let summary = fragment
+        .replace("&nbsp;", " ")
+        .replace("&mdash;", "—")
+        .replace("&ndash;", "–")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = summary.chars();
+    let shortened = chars.by_ref().take(300).collect::<String>();
+    if chars.next().is_some() {
+        format!("{shortened}...")
+    } else if shortened.is_empty() {
+        "empty response".to_owned()
+    } else {
+        shortened
+    }
+}
+
+fn extract_tag_content(body: &str, tag: &str) -> String {
+    let lower = body.to_ascii_lowercase();
+    let Some(start) = lower.find(&format!("<{tag}")) else {
+        return body.to_owned();
+    };
+    let Some(content_start) = body[start..].find('>').map(|offset| start + offset + 1) else {
+        return body.to_owned();
+    };
+    let Some(end) = lower[content_start..]
+        .find(&format!("</{tag}>"))
+        .map(|offset| content_start + offset)
+    else {
+        return body.to_owned();
+    };
+    body[content_start..end]
+        .replace("<br>", " ")
+        .replace("<br/>", " ")
+        .replace("<br />", " ")
+        .replace('<', " <")
+        .split('<')
+        .filter_map(|part| part.split_once('>').map(|(_, text)| text).or(Some(part)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ============================================================================
+// ОСНОВНАЯ ПРОГРАММА SCREENLIST PRO
+// ============================================================================
+
 enum WorkerMsg {
     VideoStarted {
         video_idx: usize,
@@ -1078,6 +2286,9 @@ struct ScreenlistApp {
     params: RenderParams,
     topology: CpuTopology,
 
+    show_fastpic_uploader: bool,
+    fastpic: FastPicSubApp,
+
     is_processing: bool,
     is_exporting: bool,
     export_done_items: usize,
@@ -1106,6 +2317,7 @@ impl ScreenlistApp {
         let topology = CpuTopology::detect();
         let workers = topology.recommended_workers();
         let font_bytes = Arc::new(load_system_font_bytes());
+        let lang = Language::Ru;
 
         Self {
             videos: Vec::new(),
@@ -1123,9 +2335,11 @@ impl ScreenlistApp {
                 hwaccel: false,
                 move_video_to_folder: false,
                 jpeg_quality: 85,
-                lang: Language::Ru,
+                lang,
             },
             topology,
+            show_fastpic_uploader: false,
+            fastpic: FastPicSubApp::new(lang),
             is_processing: false,
             is_exporting: false,
             export_done_items: 0,
@@ -1357,6 +2571,8 @@ impl ScreenlistApp {
         }
 
         self.is_processing = true;
+        self.export_done_items = 0;
+        self.export_total_items = 0;
         self.batch_total_videos = tasks.len();
         self.batch_done_videos = 0;
         self.batch_error_count = 0;
@@ -1751,6 +2967,8 @@ impl ScreenlistApp {
             .unwrap_or_default();
 
         self.is_processing = true;
+        self.export_done_items = 0;
+        self.export_total_items = 0;
         self.batch_total_videos = 1;
         self.batch_done_videos = 0;
         self.batch_error_count = 0;
@@ -2166,7 +3384,9 @@ impl ScreenlistApp {
                             }
                             VideoStatus::Processing => {
                                 ui.label(
-                                    egui::RichText::new(lang.tr("⚙ Обработка...", "⚙ Processing..."))
+                                    egui::RichText::new(
+                                        lang.tr("⚙ Обработка...", "⚙ Processing..."),
+                                    )
                                         .color(egui::Color32::from_rgb(255, 200, 80)),
                                 );
                             }
@@ -3109,7 +4329,7 @@ impl ScreenlistApp {
         }
     }
 
-    fn show_top_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn show_header_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> bool {
         let mut layout_changed = false;
         let prev_lang = self.params.lang;
         let busy = self.is_busy();
@@ -3138,6 +4358,38 @@ impl ScreenlistApp {
             ui.selectable_value(&mut self.params.lang, Language::En, "EN")
                 .on_hover_text("English language");
 
+            ui.separator();
+
+            // Кнопка переключения в подпрограмму FastPic Uploader и обратно в верхней панели
+            let fastpic_btn_text = if self.show_fastpic_uploader {
+                self.tr("⬅ Вернуться в Скринлист PRO", "⬅ Back to Screenlist PRO")
+            } else {
+                "☁ FastPic Uploader"
+            };
+            let fastpic_btn_fill = if self.show_fastpic_uploader {
+                egui::Color32::from_rgb(55, 115, 90)
+            } else {
+                egui::Color32::from_rgb(45, 85, 145)
+            };
+
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(fastpic_btn_text)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                        .fill(fastpic_btn_fill),
+                )
+                .on_hover_text(self.tr(
+                    "Открыть / закрыть подпрограмму загрузки изображений на FastPic",
+                    "Open / close FastPic image uploader subprogram",
+                ))
+                .clicked()
+            {
+                self.show_fastpic_uploader = !self.show_fastpic_uploader;
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let elapsed = if let Some(started) = self.batch_start_instant {
                     started.elapsed().as_secs_f64()
@@ -3162,6 +4414,8 @@ impl ScreenlistApp {
         });
 
         if self.params.lang != prev_lang {
+            self.fastpic.sync_language(self.params.lang);
+
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(
                 self.params
                     .lang
@@ -3183,6 +4437,12 @@ impl ScreenlistApp {
             }
         }
 
+        layout_changed
+    }
+
+    fn show_top_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut layout_changed = self.show_header_bar(ui, ctx);
+        let busy = self.is_busy();
         let lang = self.lang();
 
         ui.label(
@@ -3503,11 +4763,7 @@ impl ScreenlistApp {
 
             let total_items = self.export_total_items.max(1);
             let done_items = self.export_done_items.min(total_items);
-            let export_ratio = if self.is_exporting {
-                (done_items as f32 / total_items as f32).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
+            let export_ratio = (done_items as f32 / total_items as f32).clamp(0.0, 1.0);
 
             let export_bar_text = match lang {
                 Language::Ru => format!(
@@ -3604,8 +4860,10 @@ impl ScreenlistApp {
 impl eframe::App for ScreenlistApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_worker_messages(ctx);
+        self.fastpic.poll_additions();
+        self.fastpic.poll_uploads();
 
-        if self.is_busy() {
+        if self.is_busy() || self.fastpic.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
@@ -3618,34 +4876,58 @@ impl eframe::App for ScreenlistApp {
                 .collect()
         });
 
-        if !dropped_paths.is_empty() && !self.is_busy() {
-            self.add_video_paths(dropped_paths);
+        if !dropped_paths.is_empty() {
+            if self.show_fastpic_uploader {
+                self.fastpic.add_paths(dropped_paths);
+            } else if !self.is_busy() {
+                self.add_video_paths(dropped_paths);
+            }
         }
 
-        // Верхняя фиксированная панель управления
-        egui::TopBottomPanel::top("top_controls_panel").show(ctx, |ui| {
-            ui.add_space(4.0);
-            self.show_top_controls(ui, ctx);
-            ui.add_space(4.0);
-        });
-
-        // Левая секция «Очередь видео» — ровно 25% ширины окна
-        let window_width = ctx.screen_rect().width().max(400.0);
-        let queue_panel_width = (window_width * 0.25).max(200.0);
-
-        egui::SidePanel::left("video_queue_panel")
-            .resizable(false)
-            .exact_width(queue_panel_width)
-            .show(ctx, |ui| {
-                self.show_video_queue(ui);
+        if self.show_fastpic_uploader {
+            egui::TopBottomPanel::top("top_controls_panel").show(ctx, |ui| {
+                ui.add_space(4.0);
+                let _ = self.show_header_bar(ui, ctx);
+                ui.separator();
+                self.fastpic.draw_top_panel(ui);
+                if self.fastpic.language != self.params.lang {
+                    self.params.lang = self.fastpic.language;
+                }
+                ui.add_space(4.0);
             });
 
-        // Правая секция («Скринлист» / «Скриншоты») — оставшиеся 75% ширины окна
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some((video_idx, frame_idx)) = self.show_preview_panel(ui) {
-                self.shift_single_frame(video_idx, frame_idx);
-            }
-        });
+            egui::CentralPanel::default().show(ctx, |ui| {
+                self.fastpic.draw_settings(ui);
+                ui.add_space(12.0);
+                self.fastpic.draw_files(ui);
+                self.fastpic.draw_results(ui);
+            });
+        } else {
+            // Верхняя фиксированная панель управления
+            egui::TopBottomPanel::top("top_controls_panel").show(ctx, |ui| {
+                ui.add_space(4.0);
+                self.show_top_controls(ui, ctx);
+                ui.add_space(4.0);
+            });
+
+            // Левая секция «Очередь видео» — ровно 25% ширины окна
+            let window_width = ctx.screen_rect().width().max(400.0);
+            let queue_panel_width = (window_width * 0.25).max(200.0);
+
+            egui::SidePanel::left("video_queue_panel")
+                .resizable(false)
+                .exact_width(queue_panel_width)
+                .show(ctx, |ui| {
+                    self.show_video_queue(ui);
+                });
+
+            // Правая секция («Скринлист» / «Скриншоты») — оставшиеся 75% ширины окна
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some((video_idx, frame_idx)) = self.show_preview_panel(ui) {
+                    self.shift_single_frame(video_idx, frame_idx);
+                }
+            });
+        }
     }
 }
 
@@ -4281,5 +5563,57 @@ fn format_columns_word_lang(columns: usize, lang: Language) -> String {
                 format!("{columns} columns")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_image_path, summarize_server_response, ImageKind, UploadResponse};
+    use std::path::Path;
+
+    #[test]
+    fn formats_fastpic_bbcode() {
+        let response = UploadResponse {
+            big_link: None,
+            thumb_link: Some(
+                "https://i128.fastpic.org/thumb/2026/0731/a6/example.jpeg".to_owned(),
+            ),
+            view_link: Some("https://fastpic.org/view/128/2026/0731/example.jpg.html".to_owned()),
+            short_link: None,
+            delete_link: None,
+            width: None,
+            height: None,
+            size: None,
+            hotlinked: None,
+        };
+
+        assert_eq!(
+            response.bbcode(),
+            "[URL=https://fastpic.org/view/128/2026/0731/example.jpg.html][IMG]https://i128.fastpic.org/thumb/2026/0731/a6/example.jpeg[/IMG][/URL]"
+        );
+    }
+
+    #[test]
+    fn summarizes_html_error_response() {
+        assert_eq!(
+            summarize_server_response("<html><head><title>Upload denied</title></head></html>"),
+            "Upload denied"
+        );
+    }
+
+    #[test]
+    fn groups_video_image_names_by_suffix() {
+        assert_eq!(
+            classify_image_path(Path::new("Rude_Awakening_2_screenlist.jpg")),
+            ("Rude_Awakening_2".to_owned(), ImageKind::Screenlist)
+        );
+        assert_eq!(
+            classify_image_path(Path::new("Rude_Awakening_2_ScreenShot1.jpg")),
+            ("Rude_Awakening_2".to_owned(), ImageKind::Screenshot)
+        );
+        assert_eq!(
+            classify_image_path(Path::new("DDSC-050_ScreenShot4.jpg")),
+            ("DDSC-050".to_owned(), ImageKind::Screenshot)
+        );
     }
 }
