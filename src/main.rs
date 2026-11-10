@@ -158,6 +158,10 @@ impl Language {
             (Self::En, "russian") => "Russian",
             (Self::Ru, "english") => "Английский",
             (Self::En, "english") => "English",
+            (Self::Ru, "copy_full_bb_template") => "📋 Скопировать готовый BB-код (Шаблон релиза)",
+            (Self::En, "copy_full_bb_template") => "📋 Copy Ready BBCode (Release Template)",
+            (Self::Ru, "preview_full_bb_template") => "Показать готовый BB-код шаблона",
+            (Self::En, "preview_full_bb_template") => "Show generated BBCode template",
             _ => "",
         }
     }
@@ -1225,6 +1229,130 @@ struct FastPicSubApp {
     add_receiver: Option<mpsc::Receiver<AddProgress>>,
 }
 
+#[derive(Clone, Debug)]
+struct VideoBbMeta {
+    file_name: String,
+    duration: f64,
+    file_size: u64,
+    width: u32,
+    height: u32,
+    video_info: String,
+    audio_info: String,
+}
+
+impl VideoBbMeta {
+    fn from_video_item(item: &VideoItem, lang: Language) -> Self {
+        Self {
+            file_name: item.file_name.clone(),
+            duration: item.duration,
+            file_size: item.file_size,
+            width: item.width,
+            height: item.height,
+            video_info: item.video_info(lang).to_string(),
+            audio_info: item.audio_info(lang).to_string(),
+        }
+    }
+
+    fn format_spoiler_header(&self) -> String {
+        let duration_str = format_duration(self.duration);
+        let size_mb = self.file_size as f64 / (1024.0 * 1024.0);
+        let size_str = format!("{:.2} Mb", size_mb).replace('.', ",");
+        format!(
+            "{} | {} | {}x{} | {}",
+            duration_str, size_str, self.width, self.height, self.file_name
+        )
+    }
+}
+
+fn format_colored_tech_line(line: &str) -> String {
+    if let Some((prefix, rest)) = line.split_once(':') {
+        format!("[b][color=#cc66ff]{}:[/color][/b]{}", prefix.trim(), rest)
+    } else {
+        line.to_string()
+    }
+}
+
+fn extract_screenshot_number(path: &Path) -> usize {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if let Some(sep) = stem.rfind('_') {
+        let suffix = stem[sep + 1..].to_ascii_lowercase();
+        if let Some(num_str) = suffix.strip_prefix("screenshot") {
+            if let Ok(num) = num_str.parse::<usize>() {
+                return num;
+            }
+        }
+    }
+    0
+}
+
+fn try_probe_video_near_images(
+    video_name: &str,
+    results: &[&UploadResult],
+    lang: Language,
+) -> Option<VideoBbMeta> {
+    let mut candidate_dirs = Vec::new();
+    for res in results {
+        if let Some(parent) = res.path.parent() {
+            let p_buf = parent.to_path_buf();
+            if !candidate_dirs.contains(&p_buf) {
+                candidate_dirs.push(p_buf);
+            }
+            if let Some(grand_parent) = parent.parent() {
+                let gp_buf = grand_parent.to_path_buf();
+                if !candidate_dirs.contains(&gp_buf) {
+                    candidate_dirs.push(gp_buf);
+                }
+            }
+        }
+    }
+
+    for dir in candidate_dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && is_video_file(&path) {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if stem == video_name || stem.eq_ignore_ascii_case(video_name) {
+                    let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if let Ok(meta) = libav::probe_video(&path, file_size) {
+                        let file_name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(video_name)
+                            .to_string();
+                        let video_info = match lang {
+                            Language::Ru => meta.video_info_line,
+                            Language::En => meta.video_info_line_en,
+                        };
+                        let audio_info = match lang {
+                            Language::Ru => meta.audio_info_line,
+                            Language::En => meta.audio_info_line_en,
+                        };
+                        return Some(VideoBbMeta {
+                            file_name,
+                            duration: meta.duration,
+                            file_size,
+                            width: meta.width,
+                            height: meta.height,
+                            video_info,
+                            audio_info,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 impl FastPicSubApp {
     fn new(language: Language) -> Self {
         Self {
@@ -1733,7 +1861,7 @@ impl FastPicSubApp {
         }
     }
 
-    fn draw_results(&mut self, ui: &mut egui::Ui) {
+    fn draw_results(&mut self, ui: &mut egui::Ui, queue: &[VideoItem]) {
         ui.separator();
         ui.heading(self.language.text("results"));
         if self.results.is_empty() {
@@ -1748,16 +1876,42 @@ impl FastPicSubApp {
             .filter(|bbcode| !bbcode.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
-        ui.add_enabled_ui(!all_bbcode.is_empty(), |ui| {
-            if ui.button(self.language.text("copy_all")).clicked() {
-                copy_text_to_clipboard(ui.ctx(), &all_bbcode);
-            }
-        });
+
         let mut groups: BTreeMap<String, Vec<&UploadResult>> = BTreeMap::new();
         for result in &self.results {
             let (video_name, _) = classify_image_path(&result.path);
             groups.entry(video_name).or_default().push(result);
         }
+        // Сортируем файлы внутри каждой группы: сначала Скринлист, затем Скриншоты 1..N
+        for group_files in groups.values_mut() {
+            group_files.sort_by_key(|res| match classify_image_path(&res.path).1 {
+                ImageKind::Screenlist => (0usize, 0usize),
+                ImageKind::Screenshot => (1usize, extract_screenshot_number(&res.path)),
+                ImageKind::Other => (2usize, 0usize),
+            });
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(!all_bbcode.is_empty(), |ui| {
+                if ui.button(self.language.text("copy_all")).clicked() {
+                    copy_text_to_clipboard(ui.ctx(), &all_bbcode);
+                }
+                if ui
+                    .button(
+                        egui::RichText::new(self.language.text("copy_full_bb_template"))
+                            .strong()
+                            .color(egui::Color32::from_rgb(120, 230, 150)),
+                    )
+                    .clicked()
+                {
+                    let release_bbcode = self.generate_release_bbcode(&groups, queue);
+                    if !release_bbcode.is_empty() {
+                        copy_text_to_clipboard(ui.ctx(), &release_bbcode);
+                    }
+                }
+            });
+        });
+        
         let all_expanded = !groups.is_empty()
             && groups
             .keys()
@@ -1857,6 +2011,119 @@ impl FastPicSubApp {
                     }
                 }
             });
+    }
+    fn generate_release_bbcode(
+        &self,
+        groups: &BTreeMap<String, Vec<&UploadResult>>,
+        queue: &[VideoItem],
+    ) -> String {
+        let lang = self.language;
+        let mut full_screenshots_blocks: Vec<String> = Vec::new();
+        let mut screenlists_blocks: Vec<String> = Vec::new();
+
+        for (video_name, results) in groups {
+            let mut screenlist_bb: Option<String> = None;
+            let mut numbered_screenshots: Vec<(usize, String)> = Vec::new();
+            let mut other_screenshots: Vec<String> = Vec::new();
+
+            for result in results {
+                let Ok(response) = &result.response else {
+                    continue;
+                };
+                let bb = response.bbcode();
+                if bb.is_empty() {
+                    continue;
+                }
+                let (_, kind) = classify_image_path(&result.path);
+                match kind {
+                    ImageKind::Screenlist => {
+                        if screenlist_bb.is_none() {
+                            screenlist_bb = Some(bb);
+                        }
+                    }
+                    ImageKind::Screenshot => {
+                        let num = extract_screenshot_number(&result.path);
+                        numbered_screenshots.push((num, bb));
+                    }
+                    ImageKind::Other => {
+                        other_screenshots.push(bb);
+                    }
+                }
+            }
+
+            // Сортируем скриншоты по номеру (ScreenShot1, ScreenShot2, ...)
+            numbered_screenshots.sort_by_key(|(num, _)| *num);
+            let mut screenshot_bbs: Vec<String> = numbered_screenshots
+                .into_iter()
+                .map(|(_, bb)| bb)
+                .collect();
+            screenshot_bbs.extend(other_screenshots);
+
+            // 1. Полноразмерные скриншоты — горизонтально по 4 штуки в строке для каждого видео
+            if !screenshot_bbs.is_empty() {
+                let rows: Vec<String> = screenshot_bbs
+                    .chunks(4)
+                    .map(|chunk| chunk.join(" "))
+                    .collect();
+                full_screenshots_blocks.push(rows.join("\n"));
+            }
+
+            // 2. Скринлисты и тех. данные
+            if let Some(sl_code) = screenlist_bb {
+                let meta = queue
+                    .iter()
+                    .find(|item| {
+                        let item_stem = stem_name(&item.file_name);
+                        item_stem == *video_name || item_stem.eq_ignore_ascii_case(video_name)
+                    })
+                    .map(|item| VideoBbMeta::from_video_item(item, lang))
+                    .or_else(|| try_probe_video_near_images(video_name, results, lang));
+
+                let spoiler_title = meta
+                    .as_ref()
+                    .map(|m| m.format_spoiler_header())
+                    .unwrap_or_else(|| video_name.clone());
+
+                let mut inner_lines: Vec<String> = Vec::new();
+                if let Some(ref m) = meta {
+                    if !m.video_info.is_empty() {
+                        inner_lines.push(format_colored_tech_line(&m.video_info));
+                    }
+                    if !m.audio_info.is_empty() {
+                        inner_lines.push(format_colored_tech_line(&m.audio_info));
+                    }
+                }
+                inner_lines.push(sl_code);
+
+                let video_spoiler = format!(
+                    "[spoiler=\"{}\"]\n[align=center]{}[/align]\n[/spoiler]",
+                    spoiler_title,
+                    inner_lines.join("\n")
+                );
+                screenlists_blocks.push(video_spoiler);
+            }
+        }
+
+        let screenshots_title = lang.tr("Полноразмерные скриншоты", "Full-size screenshots");
+        let screenlists_title = lang.tr("Скринлисты и тех. данные", "Screenlists and tech. data");
+
+        let mut sections: Vec<String> = Vec::new();
+        if !full_screenshots_blocks.is_empty() {
+            sections.push(format!(
+                "[spoiler=\"{}\"]\n{}\n[/spoiler]",
+                screenshots_title,
+                full_screenshots_blocks.join("\n")
+            ));
+        }
+        if !screenlists_blocks.is_empty() {
+            sections.push(format!(
+                "[spoiler=\"{}\"]\n{}\n[/spoiler]",
+                screenlists_title,
+                screenlists_blocks.join("\n")
+            ));
+        }
+
+        sections.join("\n")
     }
 }
 
@@ -4900,7 +5167,7 @@ impl eframe::App for ScreenlistApp {
                 self.fastpic.draw_settings(ui);
                 ui.add_space(12.0);
                 self.fastpic.draw_files(ui);
-                self.fastpic.draw_results(ui);
+                self.fastpic.draw_results(ui, &self.videos);
             });
         } else {
             // Верхняя фиксированная панель управления
