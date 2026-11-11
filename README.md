@@ -1,6 +1,6 @@
 # Screenlist Generator and Uploader PRO
 
-**Screenlist Generator PRO** is a high-performance desktop utility written in **Rust** (`egui` / `eframe` + `rayon`) powered by a **Native C Libav Engine** (`FFmpeg C SDK`). It is designed for rapid batch generation of video contact sheets (screenlists) and instant inspection of video/audio stream metadata.
+**Screenlist Generator and Uploader PRO** is a high-performance desktop utility written in **Rust** (`egui` / `eframe` + `rayon`) powered by a **Native C Libav Engine** (`FFmpeg C SDK`). It is designed for rapid batch generation of video contact sheets (screenlists) and instant inspection of video/audio stream metadata.
 
 Unlike traditional wrappers that spawn hundreds of external `ffmpeg`/`ffprobe` CLI processes, **Screenlist Generator PRO** decodes frames and probes metadata directly in memory via native C bindings — delivering extreme speed and zero external setup for end users.
 
