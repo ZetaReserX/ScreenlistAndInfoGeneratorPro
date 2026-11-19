@@ -134,32 +134,102 @@ impl CpuTopology {
             return vec![WorkerSlot::default(); count];
         }
 
-        let (selected_masks, is_p) = match core_mode {
-            CoreMode::Auto | CoreMode::POnly if !self.p_core_masks.is_empty() => {
-                (&self.p_core_masks, true)
-            }
-            CoreMode::EOnly if !self.e_core_masks.is_empty() => (&self.e_core_masks, false),
-            CoreMode::Auto if !self.e_core_masks.is_empty() => (&self.e_core_masks, false),
-            _ => {
-                if !self.p_core_masks.is_empty() {
-                    (&self.p_core_masks, true)
-                } else if !self.e_core_masks.is_empty() {
-                    (&self.e_core_masks, false)
-                } else {
+        match core_mode {
+            // POnly режим - только P-cores
+            CoreMode::POnly => {
+                if self.p_core_masks.is_empty() {
                     return vec![WorkerSlot::default(); max_workers.min(4).max(1)];
                 }
+                let count = max_workers.min(self.p_core_masks.len()).max(1);
+                self.p_core_masks
+                    .iter()
+                    .take(count)
+                    .map(|&mask| WorkerSlot {
+                        affinity_mask: mask,
+                        is_p_core: true,
+                    })
+                    .collect()
             }
-        };
 
-        let count = max_workers.min(selected_masks.len()).max(1);
-        selected_masks
-            .iter()
-            .take(count)
-            .map(|&mask| WorkerSlot {
-                affinity_mask: mask,
-                is_p_core: is_p,
-            })
-            .collect()
+            // EOnly режим - только E-cores
+            CoreMode::EOnly => {
+                if self.e_core_masks.is_empty() {
+                    return vec![WorkerSlot::default(); max_workers.min(4).max(1)];
+                }
+                let count = max_workers.min(self.e_core_masks.len()).max(1);
+                self.e_core_masks
+                    .iter()
+                    .take(count)
+                    .map(|&mask| WorkerSlot {
+                        affinity_mask: mask,
+                        is_p_core: false,
+                    })
+                    .collect()
+            }
+
+            // Auto режим - МИКС P и E cores для максимальной производительности
+            CoreMode::Auto => {
+                if self.p_core_masks.is_empty() && self.e_core_masks.is_empty() {
+                    return vec![WorkerSlot::default(); max_workers.min(4).max(1)];
+                }
+
+                let mut slots = Vec::with_capacity(max_workers);
+
+                // Если есть только один тип ядер - используем их
+                if self.p_core_masks.is_empty() {
+                    let count = max_workers.min(self.e_core_masks.len()).max(1);
+                    for &mask in self.e_core_masks.iter().take(count) {
+                        slots.push(WorkerSlot {
+                            affinity_mask: mask,
+                            is_p_core: false,
+                        });
+                    }
+                    return slots;
+                }
+
+                if self.e_core_masks.is_empty() {
+                    let count = max_workers.min(self.p_core_masks.len()).max(1);
+                    for &mask in self.p_core_masks.iter().take(count) {
+                        slots.push(WorkerSlot {
+                            affinity_mask: mask,
+                            is_p_core: true,
+                        });
+                    }
+                    return slots;
+                }
+
+                // Гибридный режим: используем ВСЕ P-cores, затем E-cores
+                // Приоритет P-cores для декодирования (более тяжелая задача)
+
+                // Добавляем все доступные P-cores
+                for &mask in self.p_core_masks.iter() {
+                    if slots.len() >= max_workers {
+                        break;
+                    }
+                    slots.push(WorkerSlot {
+                        affinity_mask: mask,
+                        is_p_core: true,
+                    });
+                }
+
+                // Добавляем E-cores до достижения max_workers
+                for &mask in self.e_core_masks.iter() {
+                    if slots.len() >= max_workers {
+                        break;
+                    }
+                    slots.push(WorkerSlot {
+                        affinity_mask: mask,
+                        is_p_core: false,
+                    });
+                }
+
+                if slots.is_empty() {
+                    vec![WorkerSlot::default(); max_workers.min(4).max(1)]
+                } else {
+                    slots
+                }
+            }
+        }
     }
 
     pub fn format_info(&self, lang: Language) -> String {

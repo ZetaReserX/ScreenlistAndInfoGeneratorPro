@@ -25,6 +25,47 @@ pub enum PreviewTab {
     Screenshots,
 }
 
+/// Качество/скорость resize операций для thumbnails
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResizeQuality {
+    Fast,    // Nearest - очень быстро, низкое качество
+    Normal,  // CatmullRom - баланс (по умолчанию)
+    Quality, // Lanczos3 - медленно, высокое качество
+}
+
+impl ResizeQuality {
+    pub fn to_filter_type(self) -> image::imageops::FilterType {
+        match self {
+            ResizeQuality::Fast => image::imageops::FilterType::Nearest,
+            ResizeQuality::Normal => image::imageops::FilterType::CatmullRom,
+            ResizeQuality::Quality => image::imageops::FilterType::Lanczos3,
+        }
+    }
+
+    pub fn name_ru(&self) -> &'static str {
+        match self {
+            ResizeQuality::Fast => "Быстро (Nearest)",
+            ResizeQuality::Normal => "Нормально (CatmullRom)",
+            ResizeQuality::Quality => "Качество (Lanczos3)",
+        }
+    }
+
+    pub fn name_en(&self) -> &'static str {
+        match self {
+            ResizeQuality::Fast => "Fast (Nearest)",
+            ResizeQuality::Normal => "Normal (CatmullRom)",
+            ResizeQuality::Quality => "Quality (Lanczos3)",
+        }
+    }
+
+    pub fn name(&self, lang: Language) -> &'static str {
+        match lang {
+            Language::Ru => self.name_ru(),
+            Language::En => self.name_en(),
+        }
+    }
+}
+
 pub struct VideoItem {
     pub path: PathBuf,
     pub canonical_path: Option<PathBuf>,
@@ -87,6 +128,7 @@ pub struct RenderParams {
     pub move_video_to_folder: bool,
     pub jpeg_quality: u8,
     pub lang: Language,
+    pub resize_quality: ResizeQuality,
 }
 
 pub mod true_or_bool {

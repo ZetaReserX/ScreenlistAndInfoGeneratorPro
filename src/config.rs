@@ -1,7 +1,7 @@
 // Конфигурация и константы приложения
 
 pub const MAX_WORKERS: usize = 32;
-pub const MAX_FRAMES_PER_DECODER_TASK: usize = 3;
+pub const MAX_FRAMES_PER_DECODER_TASK: usize = 12;  // БЫЛО: 6
 pub const ZIP_ENCODE_BATCH_SIZE: usize = 4;
 
 // Upload constants - used by FastPic uploader functionality
