@@ -4,6 +4,8 @@ use crate::i18n::Language;
 use crate::upload::UploadResult;
 use crate::utils::files::is_video_file;
 
+// VideoBbMeta - used for generating BB-code templates for video releases
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct VideoBbMeta {
     pub file_name: String,
@@ -16,6 +18,7 @@ pub struct VideoBbMeta {
 }
 
 impl VideoBbMeta {
+    #[allow(dead_code)]
     pub fn from_video_item(item: &crate::video::VideoItem, lang: Language) -> Self {
         Self {
             file_name: item.file_name.clone(),
@@ -28,6 +31,7 @@ impl VideoBbMeta {
         }
     }
 
+    #[allow(dead_code)]
     pub fn format_spoiler_header(&self) -> String {
         let duration_str = format_duration(self.duration);
         let size_mb = self.file_size as f64 / (1024.0 * 1024.0);
@@ -39,6 +43,7 @@ impl VideoBbMeta {
     }
 }
 
+#[allow(dead_code)]
 pub fn format_colored_tech_line(line: &str) -> String {
     if let Some((prefix, rest)) = line.split_once(':') {
         format!("[b][color=#cc66ff]{}:[/color][/b]{}", prefix.trim(), rest)
@@ -47,6 +52,7 @@ pub fn format_colored_tech_line(line: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn extract_screenshot_number(path: &Path) -> usize {
     let stem = path
         .file_stem()
@@ -63,6 +69,7 @@ pub fn extract_screenshot_number(path: &Path) -> usize {
     0
 }
 
+#[allow(dead_code)]
 pub fn try_probe_video_near_images(
     video_name: &str,
     results: &[&UploadResult],

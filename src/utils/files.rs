@@ -44,6 +44,7 @@ pub fn is_video_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 pub fn classify_image_path(path: &Path) -> (String, crate::image::ImageKind) {
     use crate::image::ImageKind;
 
@@ -77,10 +78,12 @@ pub fn classify_image_path(path: &Path) -> (String, crate::image::ImageKind) {
     (video_name, kind)
 }
 
+#[allow(dead_code)]
 pub fn optional_string(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_owned())
 }
 
+#[allow(dead_code)]
 pub fn parse_optional_u64(value: &str, language: crate::i18n::Language) -> Result<Option<u64>, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -95,6 +98,7 @@ pub fn parse_optional_u64(value: &str, language: crate::i18n::Language) -> Resul
         })
 }
 
+#[allow(dead_code)]
 pub fn localized_error(
     language: crate::i18n::Language,
     ru_message: &str,
@@ -113,6 +117,7 @@ pub fn localized_error(
     }
 }
 
+#[allow(dead_code)]
 pub fn check_thumb_name(language: crate::i18n::Language, value: usize) -> &'static str {
     if value == 0 {
         language.text("no_text")

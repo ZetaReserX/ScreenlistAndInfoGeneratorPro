@@ -12,7 +12,6 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::MAX_FRAMES_PER_DECODER_TASK;
 use crate::i18n::Language;
 use crate::utils::{format_duration, format_file_size_lang, is_video_file};
 use crate::video::{ffmpeg, CapturedFrame, RenderParams, WorkerSlot};

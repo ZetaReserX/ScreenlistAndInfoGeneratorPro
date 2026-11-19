@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use crate::i18n::Language;
 
+// Upload types - used by FastPic uploader
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UploadResponse {
     pub big_link: Option<String>,
@@ -16,6 +18,7 @@ pub struct UploadResponse {
     pub hotlinked: Option<bool>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct AnonymousUploadResponse {
     pub status: Option<String>,
@@ -27,6 +30,7 @@ pub struct AnonymousUploadResponse {
 }
 
 impl UploadResponse {
+    #[allow(dead_code)]
     pub fn bbcode(&self) -> String {
         match (&self.view_link, &self.thumb_link) {
             (Some(view), Some(thumb)) => format!("[URL={view}][IMG]{thumb}[/IMG][/URL]"),
@@ -48,6 +52,7 @@ pub struct AddProgress {
     pub is_image: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct UploadOptions {
     pub key: Option<String>,
@@ -58,6 +63,7 @@ pub struct UploadOptions {
     pub delete_after: Option<u64>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     Anonymous,
