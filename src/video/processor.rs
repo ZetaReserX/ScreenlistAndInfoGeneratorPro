@@ -76,6 +76,61 @@ pub fn probe_video(path: &Path, file_size: u64) -> Result<ffmpeg::ProbedMedia, S
     ffmpeg::probe_video(path, file_size)
 }
 
+struct CachedDecoder {
+    path: PathBuf,
+    hwaccel: bool,
+    decoder: ffmpeg::LibavDecoder,
+}
+
+// Общий пул открытых декодеров. Раньше кэш был thread-local: каждый из 14 потоков
+// всё равно открывал файл сам, а скриншоты попадали на другие потоки и открывали его
+// заново. avformat_open_input строит индекс сэмплов (av_fast_realloc/memcpy в VTune)
+// и стоит ~0.4 с CPU на открытие, поэтому декодер берётся из общего пула и
+// возвращается в него после каждого chunk'а.
+static DECODER_POOL: std::sync::Mutex<Vec<CachedDecoder>> = std::sync::Mutex::new(Vec::new());
+const DECODER_POOL_MAX: usize = 64;
+
+fn take_cached_decoder(path: &Path, hwaccel: bool) -> Result<ffmpeg::LibavDecoder, String> {
+    let cached = {
+        let mut pool = DECODER_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let index = pool
+            .iter()
+            .position(|entry| entry.hwaccel == hwaccel && entry.path.as_path() == path);
+        let found = index.map(|i| pool.swap_remove(i));
+        found
+    };
+
+    if let Some(entry) = cached {
+        return Ok(entry.decoder);
+    }
+
+    if hwaccel {
+        ffmpeg::LibavDecoder::open(path, true).or_else(|_| ffmpeg::LibavDecoder::open(path, false))
+    } else {
+        ffmpeg::LibavDecoder::open(path, false)
+    }
+}
+
+fn store_cached_decoder(path: &Path, hwaccel: bool, decoder: ffmpeg::LibavDecoder) {
+    let mut pool = DECODER_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() < DECODER_POOL_MAX {
+        pool.push(CachedDecoder {
+            path: path.to_path_buf(),
+            hwaccel,
+            decoder,
+        });
+    }
+}
+
+/// Закрывает все декодеры из общего пула (освобождает файловые дескрипторы).
+pub fn clear_decoder_cache() {
+    let drained = {
+        let mut pool = DECODER_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *pool)
+    };
+    drop(drained);
+}
+
 pub fn extract_chunk_frames_rgb(
     path: &Path,
     chunk: &[(usize, f64)],
@@ -88,42 +143,81 @@ pub fn extract_chunk_frames_rgb(
     total_frames: usize,
     video_idx: usize,
     tx: &Sender<WorkerMsg>,
+    shared: Option<&ffmpeg::SharedDemuxer>,
 ) -> Result<Vec<(usize, CapturedFrame)>, String> {
     if chunk.is_empty() {
         return Ok(Vec::new());
     }
 
     let _affinity_guard = pin_current_thread(slot.affinity_mask);
+    let decode_start = std::time::Instant::now();
 
-    let mut decoder = if hwaccel {
-        ffmpeg::LibavDecoder::open(path, true)
-            .or_else(|_| ffmpeg::LibavDecoder::open(path, false))?
-    } else {
-        ffmpeg::LibavDecoder::open(path, false)?
-    };
+    // Быстрый путь: контейнер уже разобран общим демуксером, здесь создаётся только
+    // кодек-контекст (без avformat_open_input/find_stream_info).
+    let mut batch_decoder = shared.and_then(|dm| ffmpeg::BatchDecoder::open(dm).ok());
+    // Старый декодер открывается лениво и только если пакетный путь не сработал.
+    let mut decoder: Option<ffmpeg::LibavDecoder> = None;
 
-    // ОПТИМИЗАЦИЯ: Сортируем timestamps для последовательного чтения (минимизируем seek)
+    // ОПТИМИЗАЦИЯ #12: Сортируем timestamps для последовательного чтения (минимизируем seek)
     // Это даёт 20-30% ускорение за счёт более эффективного доступа к видеопотоку
-    let mut sorted_chunk = chunk.to_vec();
-    sorted_chunk.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Используем with_capacity для предотвращения реаллокаций при копировании
+    let mut sorted_chunk = Vec::with_capacity(chunk.len());
+    sorted_chunk.extend_from_slice(chunk);
+    sorted_chunk.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut result = Vec::with_capacity(sorted_chunk.len());
 
     for &(frame_idx, timestamp) in &sorted_chunk {
-        let image = match decoder.decode_frame_rgb(timestamp, target_w, target_h, turbo_keyframe) {
-            Ok(img) => img,
-            Err(_) => {
-                let mut fallback_dec = ffmpeg::LibavDecoder::open(path, false)?;
-                fallback_dec.decode_frame_rgb(timestamp, target_w, target_h, false)?
+        let mut image_opt: Option<RgbImage> = None;
+
+        if let (Some(dm), Some(bd)) = (shared, batch_decoder.as_mut()) {
+            let t_fetch = std::time::Instant::now();
+            let fetched = dm.fetch(timestamp, turbo_keyframe);
+            let fetch_time = t_fetch.elapsed();
+            if let Ok(batch) = fetched {
+                let t_dec = std::time::Instant::now();
+                let decoded = bd.decode_rgb(&batch, target_w, target_h, turbo_keyframe);
+                println!(
+                    "[PROFILE] frame {}x{} t={:.1}s: fetch+wait {:.2?}, decode {:.2?}",
+                    target_w,
+                    target_h,
+                    timestamp,
+                    fetch_time,
+                    t_dec.elapsed()
+                );
+                if let Ok(img) = decoded {
+                    image_opt = Some(img);
+                }
+            }
+        }
+
+        let image = match image_opt {
+            Some(img) => img,
+            None => {
+                if decoder.is_none() {
+                    decoder = Some(take_cached_decoder(path, hwaccel)?);
+                }
+                let dec = decoder.as_mut().unwrap();
+                match dec.decode_frame_rgb(timestamp, target_w, target_h, turbo_keyframe) {
+                    Ok(img) => img,
+                    Err(_) => {
+                        let mut fallback_dec = ffmpeg::LibavDecoder::open(path, false)?;
+                        fallback_dec.decode_frame_rgb(timestamp, target_w, target_h, false)?
+                    }
+                }
             }
         };
 
+        // ОПТИМИЗАЦИЯ: Батчинг progress updates - отправляем каждые 4 кадра вместо каждого
+        // Снижает contention на channel и atomic operations
         let done_frames = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = tx.send(WorkerMsg::FrameProgress {
-            video_idx,
-            done_frames,
-            total_frames,
-        });
+        if done_frames % 4 == 0 || done_frames == total_frames {
+            let _ = tx.send(WorkerMsg::FrameProgress {
+                video_idx,
+                done_frames,
+                total_frames,
+            });
+        }
 
         result.push((
             frame_idx,
@@ -132,6 +226,15 @@ pub fn extract_chunk_frames_rgb(
                 rgb: Arc::new(image),
             },
         ));
+    }
+
+    if !result.is_empty() {
+        println!("[PROFILE] Chunk {} frames: {:.2?}", result.len(), decode_start.elapsed());
+    }
+
+    // Возвращаем открытый декодер в кэш потока для следующего chunk'а/скриншота
+    if let Some(dec) = decoder {
+        store_cached_decoder(path, hwaccel, dec);
     }
 
     Ok(result)
@@ -282,6 +385,7 @@ pub fn compose_contact_sheet(
     params: RenderParams,
     font_bytes: &[u8],
 ) -> (RgbImage, u32, u32) {
+    let total_start = std::time::Instant::now();
     let cols = params.columns.max(1) as u32;
     let rows = ((frames.len() as u32 + cols - 1) / cols).max(1);
 
@@ -366,10 +470,9 @@ pub fn compose_contact_sheet(
     let canvas_stride = (total_w * 3) as usize;
 
     // Используем выбранное пользователем качество resize
-    // Fast (Nearest): очень быстро, но низкое качество
-    // Normal (CatmullRom): баланс скорости и качества (по умолчанию, на 30-50% быстрее Triangle)
-    // Quality (Lanczos3): медленно, но максимальное качество
     let filter_type = params.resize_quality.to_filter_type();
+
+    let compose_start = std::time::Instant::now();
 
     let resized_frames: Vec<Option<RgbImage>> = frames
         .par_iter()
@@ -397,19 +500,17 @@ pub fn compose_contact_sheet(
         let resized = resized_frames[index]
             .as_ref()
             .unwrap_or_else(|| frame.rgb.as_ref());
-        let source = resized.as_raw();
+        let source_raw = resized.as_raw();
         let destination = canvas.as_mut();
 
-        // ОПТИМИЗАЦИЯ #10: Используем unsafe для копирования пикселей (избегаем bounds checks)
-        // Это безопасно, так как мы гарантируем корректные offset'ы через расчёты выше
+        // ОПТИМИЗАЦИЯ: Используем unsafe для копирования пикселей
         for py in 0..thumb_h as usize {
             let source_offset = py * row_bytes;
             let destination_offset = (y0 as usize + py) * canvas_stride + x0 as usize * 3;
 
-            // Используем copy_nonoverlapping для максимальной скорости (без bounds checks)
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    source.as_ptr().add(source_offset),
+                    source_raw.as_ptr().add(source_offset),
                     destination.as_mut_ptr().add(destination_offset),
                     row_bytes
                 );
@@ -440,6 +541,9 @@ pub fn compose_contact_sheet(
             }
         }
     }
+
+    println!("[PROFILE] Compose: {:.2?}", compose_start.elapsed());
+    println!("[PROFILE] Total sheet: {:.2?}", total_start.elapsed());
 
     (canvas, thumb_w, thumb_h)
 }

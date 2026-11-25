@@ -279,11 +279,15 @@ impl ScreenlistApp {
             return;
         }
 
+        println!("\n========== ПРОФИЛИРОВАНИЕ ==========");
+        let total_generation = std::time::Instant::now();
+
         let lang = self.lang();
         let mut unique_indices = indices;
         unique_indices.sort_unstable();
         unique_indices.dedup();
 
+        let probe_start = std::time::Instant::now();
         let tasks: Vec<(usize, PathBuf, String, u64, f64, u32, u32)> = unique_indices
             .into_iter()
             .filter_map(|index| {
@@ -302,6 +306,7 @@ impl ScreenlistApp {
                 })
             })
             .collect();
+        println!("[PROFILE] Probe {} videos: {:.2?}", tasks.len(), probe_start.elapsed());
 
         if tasks.is_empty() {
             self.status_line = lang
@@ -362,7 +367,7 @@ impl ScreenlistApp {
             let mut total_p_frames = 0usize;
             let mut total_e_frames = 0usize;
 
-            for (video_idx, path, file_name, file_size, duration, width, height) in tasks {
+            let process_video = |(video_idx, path, file_name, file_size, duration, width, height): (usize, PathBuf, String, u64, f64, u32, u32)| -> Option<(usize, usize)> {
                 let _ = tx.send(WorkerMsg::VideoStarted { video_idx });
                 let video_t0 = Instant::now();
 
@@ -417,19 +422,48 @@ impl ScreenlistApp {
 
                 let done_counter = AtomicUsize::new(0);
 
-                let extracted: Result<Vec<(bool, Vec<(usize, CapturedFrame)>)>, String> =
+                // Контейнер разбирается один раз на видео (avformat_open_input + find_stream_info),
+                // потоки rayon создают только кодек-контексты. С hwaccel остаётся старый путь.
+                let shared_demuxer = if params.hwaccel {
+                    None
+                } else {
+                    ffmpeg::SharedDemuxer::open(&path).ok()
+                };
+
+                // Кадры сетки и скриншоты обрабатываются одним проходом по пулу: нет барьера
+                // между ними, а тяжёлые полноразмерные скриншоты идут первыми и не образуют хвост.
+                let full_w = width.max(64);
+                let full_h = height.max(36);
+                let ss_step = safe_end / (screenshot_count as f64 + 1.0);
+
+                // (is_screenshot, chunk, w, h)
+                let mut work: Vec<(bool, Vec<(usize, f64)>, u32, u32)> =
+                    Vec::with_capacity(chunks.len() + screenshot_count);
+                for index in 0..screenshot_count {
+                    work.push((
+                        true,
+                        vec![(index, ss_step * (index as f64 + 1.0))],
+                        full_w,
+                        full_h,
+                    ));
+                }
+                for chunk in chunks {
+                    work.push((false, chunk, decode_w, decode_h));
+                }
+
+                let combined: Result<Vec<(bool, bool, Vec<(usize, CapturedFrame)>)>, String> =
                     pool.install(|| {
-                        chunks
-                            .par_iter()
-                            .map(|chunk| {
+                        work.par_iter()
+                            .with_max_len(1)
+                            .map(|(is_ss, chunk, w, h)| {
                                 let worker_idx = rayon::current_thread_index().unwrap_or(0);
                                 let slot = slots[worker_idx % slots.len()];
 
                                 extract_chunk_frames_rgb(
                                     &path,
                                     chunk,
-                                    decode_w,
-                                    decode_h,
+                                    *w,
+                                    *h,
                                     params.turbo_keyframe,
                                     params.hwaccel,
                                     slot,
@@ -437,16 +471,36 @@ impl ScreenlistApp {
                                     total_work_frames,
                                     video_idx,
                                     &tx,
+                                    shared_demuxer.as_ref(),
                                 )
-                                    .map(|frames| (slot.is_p_core, frames))
+                                    .map(|frames| (*is_ss, slot.is_p_core, frames))
                             })
                             .collect()
                     });
 
+                let (extracted, ss_extracted_pre): (
+                    Result<Vec<(bool, Vec<(usize, CapturedFrame)>)>, String>,
+                    Result<Vec<(bool, Vec<(usize, CapturedFrame)>)>, String>,
+                ) = match combined {
+                    Err(error) => (Err(error.clone()), Err(error)),
+                    Ok(all) => {
+                        let mut frame_parts = Vec::new();
+                        let mut shot_parts = Vec::new();
+                        for (is_ss, is_p_core, part) in all {
+                            if is_ss {
+                                shot_parts.push((is_p_core, part));
+                            } else {
+                                frame_parts.push((is_p_core, part));
+                            }
+                        }
+                        (Ok(frame_parts), Ok(shot_parts))
+                    }
+                };
+
                 let parts = match extracted {
                     Err(error) => {
                         let _ = tx.send(WorkerMsg::VideoError { video_idx, error });
-                        continue;
+                        return None;
                     }
                     Ok(parts) => parts,
                 };
@@ -483,7 +537,7 @@ impl ScreenlistApp {
                             ),
                         },
                     });
-                    continue;
+                    return None;
                 }
 
                 indexed_frames.sort_by_key(|(frame_idx, _)| *frame_idx);
@@ -493,43 +547,13 @@ impl ScreenlistApp {
                 // Извлечение полноразмерных скриншотов (от 0 до 10)
                 let mut screenshots = Vec::with_capacity(screenshot_count);
                 if screenshot_count > 0 {
-                    let full_w = width.max(64);
-                    let full_h = height.max(36);
-                    let ss_step = safe_end / (screenshot_count as f64 + 1.0);
-                    let ss_timestamps: Vec<Vec<(usize, f64)>> = (0..screenshot_count)
-                        .map(|index| vec![(index, ss_step * (index as f64 + 1.0))])
-                        .collect();
-
-                    let ss_extracted: Result<Vec<(bool, Vec<(usize, CapturedFrame)>)>, String> =
-                        pool.install(|| {
-                            ss_timestamps
-                                .par_iter()
-                                .map(|chunk| {
-                                    let worker_idx = rayon::current_thread_index().unwrap_or(0);
-                                    let slot = slots[worker_idx % slots.len()];
-
-                                    extract_chunk_frames_rgb(
-                                        &path,
-                                        chunk,
-                                        full_w,
-                                        full_h,
-                                        params.turbo_keyframe,
-                                        params.hwaccel,
-                                        slot,
-                                        &done_counter,
-                                        total_work_frames,
-                                        video_idx,
-                                        &tx,
-                                    )
-                                        .map(|ss_part| (slot.is_p_core, ss_part))
-                                })
-                                .collect()
-                        });
+                    // Скриншоты уже извлечены общим проходом выше
+                    let ss_extracted = ss_extracted_pre;
 
                     match ss_extracted {
                         Err(error) => {
                             let _ = tx.send(WorkerMsg::VideoError { video_idx, error });
-                            continue;
+                            return None;
                         }
                         Ok(ss_parts) => {
                             let mut indexed_ss = Vec::with_capacity(screenshot_count);
@@ -549,6 +573,7 @@ impl ScreenlistApp {
                     }
                 }
 
+
                 let (sheet, sheet_thumb_w, sheet_thumb_h) = compose_contact_sheet(
                     &file_name,
                     file_size,
@@ -560,8 +585,6 @@ impl ScreenlistApp {
                     &font_bytes,
                 );
 
-                total_p_frames += p_frames;
-                total_e_frames += e_frames;
 
                 let _ = tx.send(WorkerMsg::VideoFinished {
                     video_idx,
@@ -573,13 +596,31 @@ impl ScreenlistApp {
                     thumb_w: sheet_thumb_w,
                     thumb_h: sheet_thumb_h,
                 });
+                Some((p_frames, e_frames))
+            };
+
+            let results: Vec<Option<(usize, usize)>> = pool.install(|| {
+                tasks
+                    .into_par_iter()
+                    .with_max_len(1)
+                    .map(process_video)
+                    .collect()
+            });
+            for (p, e) in results.into_iter().flatten() {
+                total_p_frames += p;
+                total_e_frames += e;
             }
+
+            clear_decoder_cache();
 
             let _ = tx.send(WorkerMsg::BatchComplete {
                 total_elapsed: batch_t0.elapsed(),
                 total_p_frames,
                 total_e_frames,
             });
+
+            println!("[PROFILE] ИТОГО генерация: {:.2?}", total_generation.elapsed());
+            println!("====================================\n");
         });
     }
 
@@ -747,8 +788,10 @@ impl ScreenlistApp {
                         timestamp: new_timestamp,
                         rgb: Arc::new(rgb),
                     };
+
                     frames[frame_idx] = updated.clone();
 
+                    // Лист собираем в рабочем потоке, чтобы не блокировать UI
                     let (sheet, thumb_w, thumb_h) = compose_contact_sheet(
                         &file_name,
                         file_size,

@@ -70,6 +70,32 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn sl_decoder_close(dec: *mut c_void);
+
+    // Общий демуксер: контейнер разбирается один раз на видео.
+    fn sl_demuxer_open(path: *const c_char, err_buf: *mut c_char, err_cap: usize) -> *mut c_void;
+    fn sl_demuxer_close(dm: *mut c_void);
+    fn sl_demuxer_fetch(
+        dm: *mut c_void,
+        timestamp_sec: f64,
+        turbo_keyframe: c_int,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> *mut c_void;
+    fn sl_batch_free(batch: *mut c_void);
+
+    // Декодер, работающий только с пакетами из демуксера (по одному на поток).
+    fn sl_batch_decoder_open(dm: *mut c_void, err_buf: *mut c_char, err_cap: usize) -> *mut c_void;
+    fn sl_batch_decoder_close(bd: *mut c_void);
+    fn sl_batch_decode_rgb(
+        bd: *mut c_void,
+        batch: *mut c_void,
+        target_w: u32,
+        target_h: u32,
+        turbo_keyframe: c_int,
+        out_rgb: *mut u8,
+        err_buf: *mut c_char,
+        err_cap: usize,
+    ) -> c_int;
 }
 
 static INIT: Once = Once::new();
@@ -309,6 +335,10 @@ pub fn probe_video(path: &Path, file_size: u64) -> Result<ProbedMedia, String> {
     })
 }
 
+// SAFETY: контекст libav не разделяется между потоками одновременно: декодер
+// принадлежит одной задаче, а между задачами передаётся только через Mutex-пул.
+unsafe impl Send for LibavDecoder {}
+
 pub struct LibavDecoder {
     raw: *mut c_void,
 }
@@ -378,6 +408,164 @@ impl Drop for LibavDecoder {
         if !self.raw.is_null() {
             unsafe {
                 sl_decoder_close(self.raw);
+            }
+        }
+    }
+}
+
+/// Контейнер, открытый один раз на видео. Чтение пакетов (seek + read_frame)
+/// сериализуется Mutex'ом, а декодирование идёт параллельно в `BatchDecoder`.
+#[allow(dead_code)]
+pub struct SharedDemuxer {
+    raw: *mut c_void,
+    lock: std::sync::Mutex<()>,
+}
+
+// SAFETY: все обращения к AVFormatContext идут через `fetch` под Mutex,
+// поэтому из нескольких потоков одновременно он не используется.
+unsafe impl Send for SharedDemuxer {}
+unsafe impl Sync for SharedDemuxer {}
+
+#[allow(dead_code)]
+impl SharedDemuxer {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        init();
+        let c_path = path_to_cstring(path)?;
+        let mut err_buf = [0 as c_char; 512];
+
+        let raw = unsafe { sl_demuxer_open(c_path.as_ptr(), err_buf.as_mut_ptr(), err_buf.len()) };
+        if raw.is_null() {
+            return Err(read_err_buf(&err_buf));
+        }
+
+        Ok(Self {
+            raw,
+            lock: std::sync::Mutex::new(()),
+        })
+    }
+
+    /// Делает seek к ключевому кадру перед `timestamp_sec` и забирает пакеты,
+    /// нужные декодеру. Вызовы сериализуются внутренним Mutex'ом.
+    pub fn fetch(&self, timestamp_sec: f64, turbo_keyframe: bool) -> Result<PacketBatch, String> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut err_buf = [0 as c_char; 512];
+
+        let raw = unsafe {
+            sl_demuxer_fetch(
+                self.raw,
+                timestamp_sec,
+                c_int::from(turbo_keyframe),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+
+        if raw.is_null() {
+            return Err(read_err_buf(&err_buf));
+        }
+
+        Ok(PacketBatch { raw })
+    }
+}
+
+impl Drop for SharedDemuxer {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                sl_demuxer_close(self.raw);
+            }
+        }
+    }
+}
+
+/// Набор пакетов для одного кадра. Не привязан к демуксеру и после `fetch`
+/// может быть передан в другой поток.
+#[allow(dead_code)]
+pub struct PacketBatch {
+    raw: *mut c_void,
+}
+
+// SAFETY: пакеты полностью принадлежат батчу и используются одним потоком.
+unsafe impl Send for PacketBatch {}
+
+impl Drop for PacketBatch {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                sl_batch_free(self.raw);
+            }
+        }
+    }
+}
+
+/// Декодер, который работает только с кодек-контекстом и готовыми пакетами,
+/// без разбора контейнера. Создаётся по одному на поток.
+#[allow(dead_code)]
+pub struct BatchDecoder {
+    raw: *mut c_void,
+}
+
+// SAFETY: контекст принадлежит одному владельцу, к AVFormatContext не обращается.
+unsafe impl Send for BatchDecoder {}
+
+#[allow(dead_code)]
+impl BatchDecoder {
+    pub fn open(demuxer: &SharedDemuxer) -> Result<Self, String> {
+        let mut err_buf = [0 as c_char; 512];
+
+        // Параметры кодека копируются при создании, поэтому декодер не держит ссылок на демуксер.
+        let raw = unsafe { sl_batch_decoder_open(demuxer.raw, err_buf.as_mut_ptr(), err_buf.len()) };
+        if raw.is_null() {
+            return Err(read_err_buf(&err_buf));
+        }
+
+        Ok(Self { raw })
+    }
+
+    pub fn decode_rgb(
+        &mut self,
+        batch: &PacketBatch,
+        target_w: u32,
+        target_h: u32,
+        turbo_keyframe: bool,
+    ) -> Result<RgbImage, String> {
+        let frame_bytes = (target_w as usize)
+            .checked_mul(target_h as usize)
+            .and_then(|px| px.checked_mul(3))
+            .ok_or_else(|| "Frame buffer overflow.".to_owned())?;
+
+        // +64 байта запаса: sws_scale может писать чуть за границу строки.
+        let mut rgb_buf = vec![0u8; frame_bytes + 64];
+        let mut err_buf = [0 as c_char; 512];
+
+        let ret = unsafe {
+            sl_batch_decode_rgb(
+                self.raw,
+                batch.raw,
+                target_w,
+                target_h,
+                c_int::from(turbo_keyframe),
+                rgb_buf.as_mut_ptr(),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+
+        if ret != 0 {
+            return Err(read_err_buf(&err_buf));
+        }
+
+        rgb_buf.truncate(frame_bytes);
+        RgbImage::from_raw(target_w, target_h, rgb_buf)
+            .ok_or_else(|| "Failed to create RgbImage.".to_owned())
+    }
+}
+
+impl Drop for BatchDecoder {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                sl_batch_decoder_close(self.raw);
             }
         }
     }

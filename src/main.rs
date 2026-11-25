@@ -1,3 +1,4 @@
+// Закомментировать эту строку для профилирования (чтобы видеть консоль):
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;

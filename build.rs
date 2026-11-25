@@ -503,6 +503,337 @@ static int decode_Attempt(
     return 0;
 }
 
+// Shared demuxer: the container (sample index) is parsed once per video, packets are fetched under a lock and decoded in parallel by per-thread codec contexts.
+typedef struct SlDemuxer {
+    AVFormatContext *fmt_ctx;
+    int stream_index;
+    AVRational time_base;
+    int64_t start_time;
+} SlDemuxer;
+
+typedef struct SlPacketBatch {
+    AVPacket **pkts;
+    int count;
+    int cap;
+    int64_t target_pts;
+} SlPacketBatch;
+
+void sl_demuxer_close(SlDemuxer *dm) {
+    if (!dm) return;
+    if (dm->fmt_ctx) avformat_close_input(&dm->fmt_ctx);
+    free(dm);
+}
+
+SlDemuxer* sl_demuxer_open(const char *path, char *err_buf, size_t err_cap) {
+    SlDemuxer *dm = (SlDemuxer *)calloc(1, sizeof(SlDemuxer));
+    if (!dm) {
+        write_err(err_buf, err_cap, "Out of memory", 0);
+        return NULL;
+    }
+
+    int ret = avformat_open_input(&dm->fmt_ctx, path, NULL, NULL);
+    if (ret < 0) {
+        write_err(err_buf, err_cap, "avformat_open_input failed", ret);
+        sl_demuxer_close(dm);
+        return NULL;
+    }
+
+    ret = avformat_find_stream_info(dm->fmt_ctx, NULL);
+    if (ret < 0) {
+        write_err(err_buf, err_cap, "avformat_find_stream_info failed", ret);
+        sl_demuxer_close(dm);
+        return NULL;
+    }
+
+    const AVCodec *decoder = NULL;
+    dm->stream_index = av_find_best_stream(dm->fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+    if (dm->stream_index < 0 || !decoder) {
+        write_err(err_buf, err_cap, "Video decoder not found", dm->stream_index);
+        sl_demuxer_close(dm);
+        return NULL;
+    }
+
+    AVStream *stream = dm->fmt_ctx->streams[dm->stream_index];
+    dm->time_base = stream->time_base;
+    dm->start_time = stream->start_time;
+
+    for (unsigned int i = 0; i < dm->fmt_ctx->nb_streams; i++) {
+        if ((int)i != dm->stream_index) {
+            dm->fmt_ctx->streams[i]->discard = AVDISCARD_ALL;
+        }
+    }
+    return dm;
+}
+
+void sl_batch_free(SlPacketBatch *batch) {
+    if (!batch) return;
+    for (int i = 0; i < batch->count; i++) {
+        av_packet_free(&batch->pkts[i]);
+    }
+    free(batch->pkts);
+    free(batch);
+}
+
+static int batch_push(SlPacketBatch *batch, AVPacket *src) {
+    if (batch->count == batch->cap) {
+        int new_cap = batch->cap ? batch->cap * 2 : 16;
+        AVPacket **grown = (AVPacket **)realloc(batch->pkts, sizeof(AVPacket *) * (size_t)new_cap);
+        if (!grown) return -1;
+        batch->pkts = grown;
+        batch->cap = new_cap;
+    }
+    AVPacket *copy = av_packet_alloc();
+    if (!copy) return -1;
+    av_packet_move_ref(copy, src);
+    batch->pkts[batch->count++] = copy;
+    return 0;
+}
+
+// Seeks to the keyframe before timestamp_sec and collects the packets the decoder needs.
+// Not thread-safe: the caller must hold a lock around this call.
+SlPacketBatch* sl_demuxer_fetch(SlDemuxer *dm, double timestamp_sec, int turbo_keyframe, char *err_buf, size_t err_cap) {
+    SlPacketBatch *batch = (SlPacketBatch *)calloc(1, sizeof(SlPacketBatch));
+    if (!batch) {
+        write_err(err_buf, err_cap, "Out of memory", 0);
+        return NULL;
+    }
+
+    double tb = av_q2d(dm->time_base);
+    int64_t base_pts = (dm->start_time != AV_NOPTS_VALUE) ? dm->start_time : 0;
+    int64_t offset_pts = (tb > 0.0 && timestamp_sec > 0.0) ? (int64_t)(timestamp_sec / tb + 0.5) : 0;
+    batch->target_pts = base_pts + offset_pts;
+
+    if (av_seek_frame(dm->fmt_ctx, dm->stream_index, batch->target_pts, AVSEEK_FLAG_BACKWARD) < 0) {
+        av_seek_frame(dm->fmt_ctx, dm->stream_index, 0, AVSEEK_FLAG_BACKWARD);
+    }
+
+    AVPacket *pkt = av_packet_alloc();
+    if (!pkt) {
+        write_err(err_buf, err_cap, "Failed to allocate packet", 0);
+        sl_batch_free(batch);
+        return NULL;
+    }
+
+    const int max_packets = turbo_keyframe ? 64 : 256;
+    int extra_after_target = -1;
+
+    while (batch->count < max_packets) {
+        if (av_read_frame(dm->fmt_ctx, pkt) < 0) break;
+        if (pkt->stream_index != dm->stream_index) {
+            av_packet_unref(pkt);
+            continue;
+        }
+
+        int is_key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+        int64_t pkt_ts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
+
+        if (batch_push(batch, pkt) < 0) break;
+
+        if (turbo_keyframe) {
+            if (is_key) break;
+        } else if (extra_after_target >= 0) {
+            extra_after_target++;
+            if (extra_after_target >= 16) break;
+        } else if (pkt_ts != AV_NOPTS_VALUE && pkt_ts >= batch->target_pts) {
+            extra_after_target = 0;
+        }
+    }
+    av_packet_free(&pkt);
+
+    if (batch->count == 0) {
+        write_err(err_buf, err_cap, "No packets at timestamp", 0);
+        sl_batch_free(batch);
+        return NULL;
+    }
+    return batch;
+}
+
+// Packet-only decoder: owns an AVCodecContext created from the shared demuxer's codec parameters.
+// It never touches the AVFormatContext after creation, so one instance per thread is safe.
+typedef struct SlBatchDecoder {
+    AVCodecContext *codec_ctx;
+    AVFrame *frame;
+    AVFrame *best_frame;
+    struct SwsContext *sws_ctx;
+} SlBatchDecoder;
+
+void sl_batch_decoder_close(SlBatchDecoder *bd) {
+    if (!bd) return;
+    if (bd->sws_ctx) sws_freeContext(bd->sws_ctx);
+    if (bd->frame) av_frame_free(&bd->frame);
+    if (bd->best_frame) av_frame_free(&bd->best_frame);
+    if (bd->codec_ctx) avcodec_free_context(&bd->codec_ctx);
+    free(bd);
+}
+
+SlBatchDecoder* sl_batch_decoder_open(SlDemuxer *dm, char *err_buf, size_t err_cap) {
+    if (!dm || !dm->fmt_ctx) {
+        write_err(err_buf, err_cap, "Null demuxer", 0);
+        return NULL;
+    }
+
+    AVStream *stream = dm->fmt_ctx->streams[dm->stream_index];
+    const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+    if (!decoder) {
+        write_err(err_buf, err_cap, "Video decoder not found", 0);
+        return NULL;
+    }
+
+    SlBatchDecoder *bd = (SlBatchDecoder *)calloc(1, sizeof(SlBatchDecoder));
+    if (!bd) {
+        write_err(err_buf, err_cap, "Out of memory", 0);
+        return NULL;
+    }
+
+    bd->codec_ctx = avcodec_alloc_context3(decoder);
+    if (!bd->codec_ctx) {
+        write_err(err_buf, err_cap, "avcodec_alloc_context3 failed", 0);
+        sl_batch_decoder_close(bd);
+        return NULL;
+    }
+
+    int ret = avcodec_parameters_to_context(bd->codec_ctx, stream->codecpar);
+    if (ret < 0) {
+        write_err(err_buf, err_cap, "avcodec_parameters_to_context failed", ret);
+        sl_batch_decoder_close(bd);
+        return NULL;
+    }
+
+    bd->codec_ctx->thread_count = 1;
+    bd->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+    bd->codec_ctx->pkt_timebase = dm->time_base;
+
+    ret = avcodec_open2(bd->codec_ctx, decoder, NULL);
+    if (ret < 0) {
+        write_err(err_buf, err_cap, "avcodec_open2 failed", ret);
+        sl_batch_decoder_close(bd);
+        return NULL;
+    }
+
+    bd->frame = av_frame_alloc();
+    bd->best_frame = av_frame_alloc();
+    if (!bd->frame || !bd->best_frame) {
+        write_err(err_buf, err_cap, "Failed to allocate frame", 0);
+        sl_batch_decoder_close(bd);
+        return NULL;
+    }
+    return bd;
+}
+
+// Drains decoded frames. Returns 1 when the target frame has been reached, 0 to keep feeding, -1 on a hard error.
+static int batch_drain(SlBatchDecoder *bd, int64_t target_pts, int turbo_keyframe, int *eof_seen) {
+    while (1) {
+        int recv_ret = avcodec_receive_frame(bd->codec_ctx, bd->frame);
+        if (recv_ret == AVERROR(EAGAIN)) return 0;
+        if (recv_ret == AVERROR_EOF) {
+            *eof_seen = 1;
+            return 0;
+        }
+        if (recv_ret < 0) return -1;
+
+        int64_t pts = (bd->frame->best_effort_timestamp != AV_NOPTS_VALUE)
+            ? bd->frame->best_effort_timestamp
+            : bd->frame->pts;
+
+        av_frame_unref(bd->best_frame);
+        av_frame_move_ref(bd->best_frame, bd->frame);
+
+        if (turbo_keyframe || (pts != AV_NOPTS_VALUE && pts >= target_pts)) {
+            return 1;
+        }
+    }
+}
+
+int sl_batch_decode_rgb(
+    SlBatchDecoder *bd,
+    SlPacketBatch *batch,
+    uint32_t target_w,
+    uint32_t target_h,
+    int turbo_keyframe,
+    uint8_t *out_rgb,
+    char *err_buf,
+    size_t err_cap
+) {
+    if (!bd || !batch || batch->count == 0) {
+        write_err(err_buf, err_cap, "Empty packet batch", 0);
+        return -1;
+    }
+
+    bd->codec_ctx->skip_frame = turbo_keyframe ? AVDISCARD_NONKEY : AVDISCARD_DEFAULT;
+    avcodec_flush_buffers(bd->codec_ctx);
+    av_frame_unref(bd->best_frame);
+
+    int reached = 0;
+    int eof_seen = 0;
+
+    for (int i = 0; i < batch->count && !reached; i++) {
+        int send_ret = avcodec_send_packet(bd->codec_ctx, batch->pkts[i]);
+        if (send_ret == AVERROR(EAGAIN)) {
+            int d = batch_drain(bd, batch->target_pts, turbo_keyframe, &eof_seen);
+            if (d < 0) break;
+            if (d == 1) { reached = 1; break; }
+            send_ret = avcodec_send_packet(bd->codec_ctx, batch->pkts[i]);
+        }
+        if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) break;
+
+        int d = batch_drain(bd, batch->target_pts, turbo_keyframe, &eof_seen);
+        if (d < 0) break;
+        if (d == 1) reached = 1;
+    }
+
+    if (!reached && !bd->best_frame->data[0]) {
+        avcodec_send_packet(bd->codec_ctx, NULL);
+        batch_drain(bd, batch->target_pts, turbo_keyframe, &eof_seen);
+    }
+
+    if (!bd->best_frame->data[0]) {
+        write_err(err_buf, err_cap, "No frame decoded at timestamp", 0);
+        return -1;
+    }
+
+    AVFrame *src_frame = bd->best_frame;
+    int src_w = src_frame->width;
+    int src_h = src_frame->height;
+    enum AVPixelFormat src_fmt = (enum AVPixelFormat)src_frame->format;
+
+    if (src_w <= 0 || src_h <= 0 || src_fmt == AV_PIX_FMT_NONE) {
+        av_frame_unref(bd->best_frame);
+        write_err(err_buf, err_cap, "Invalid decoded frame format", 0);
+        return -1;
+    }
+
+    bd->sws_ctx = sws_getCachedContext(
+        bd->sws_ctx,
+        src_w, src_h, src_fmt,
+        (int)target_w, (int)target_h, AV_PIX_FMT_RGB24,
+        SWS_FAST_BILINEAR, NULL, NULL, NULL
+    );
+    if (!bd->sws_ctx) {
+        av_frame_unref(bd->best_frame);
+        write_err(err_buf, err_cap, "sws_getCachedContext failed", 0);
+        return -1;
+    }
+
+    uint8_t *dst_data[4] = { out_rgb, NULL, NULL, NULL };
+    int dst_linesize[4] = { (int)(target_w * 3), 0, 0, 0 };
+
+    int scaled_h = sws_scale(
+        bd->sws_ctx,
+        (const uint8_t *const *)src_frame->data,
+        src_frame->linesize,
+        0, src_h,
+        dst_data, dst_linesize
+    );
+
+    av_frame_unref(bd->best_frame);
+
+    if (scaled_h <= 0) {
+        write_err(err_buf, err_cap, "sws_scale failed", scaled_h);
+        return -1;
+    }
+    return 0;
+}
+
 int sl_decoder_decode_rgb(
     SlDecoder *dec,
     double timestamp_sec,
